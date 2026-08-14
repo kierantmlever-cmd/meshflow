@@ -1,0 +1,16 @@
+# Build output.
+/target
+
+# Runtime state, none of which belongs to the project. Config lives in ~/.config/meshflow and the
+# database and logs in ~/.local/share/meshflow, so nothing here should normally appear — these are
+# listed so a stray copy in the working tree can never be committed by accident.
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Credentials. API keys live in the OS keychain and never touch the repo; this is a backstop, not
+# a place anything is expected to be.
+.env
+.env.*
+*.pem

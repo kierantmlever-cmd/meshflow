@@ -1,0 +1,54 @@
+[package]
+name = "mf-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MeshFlow engine: agents, providers, tools. Send + Sync. Never depends on freya."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "fs", "process"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Rolling daily file + a background writer thread, so a slow disk never stalls an agent turn.
+tracing-appender = "0.2"
+
+bitflags = { version = "2.13", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+eventsource-stream = "0.2"
+globset = "0.4"
+keyring = "4.1"
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "migrate",
+    # For `migrate!` only, which embeds the SQL in the binary so the app ships self-contained.
+    # Queries stay runtime-checked (`query`, not `query!`) so building needs no DATABASE_URL.
+    "macros",
+] }
+toml = "1"
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "http2",
+    "charset",
+    # Native cert store, not bundled roots: desktop users sit behind corporate proxies with
+    # custom CAs, and bundled roots reject those.
+    "rustls",
+    "rustls-native-certs",
+    "system-proxy",
+] }
+secrecy = "0.10"
+# Myers diff for the write-approval modal. A hand-rolled line comparison is easy to write and
+# easy to get subtly wrong, and a misleading diff on a consent screen is the worst kind of bug.
+similar = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["net", "io-util", "test-util"] }

@@ -1,0 +1,17 @@
+{
+  "grammars": [
+    {
+      "name": "skript",
+      "camelcase": "Skript",
+      "scope": "source.skript",
+      "path": ".",
+      "file-types": ["sk"],
+      "highlights": ["queries/highlights.scm"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Skript grammar for tree-sitter, derived from the Sk-VSC TextMate grammar"
+  }
+}

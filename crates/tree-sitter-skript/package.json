@@ -1,0 +1,15 @@
+{
+  "name": "tree-sitter-skript",
+  "version": "0.1.0",
+  "description": "Skript grammar for tree-sitter, derived from the Sk-VSC TextMate grammar",
+  "//": "type=commonjs is load bearing: tree-sitter's generator requires grammar.js to be CommonJS, and a parent directory's package.json marking the tree as an ES module makes `module.exports` a ReferenceError.",
+  "type": "commonjs",
+  "main": "grammar.js",
+  "tree-sitter": [
+    {
+      "scope": "source.skript",
+      "file-types": ["sk"],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}

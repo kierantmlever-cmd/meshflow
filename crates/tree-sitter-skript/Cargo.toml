@@ -1,0 +1,19 @@
+[package]
+name = "tree-sitter-skript"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Skript grammar for tree-sitter, derived from the Sk-VSC TextMate grammar"
+# The generated parser is C. Everything under src/ except lib.rs is machine output from
+# `tree-sitter generate` and should be regenerated, never hand-edited.
+build = "build.rs"
+include = ["build.rs", "src/*.rs", "src/*.c", "src/tree_sitter/*.h", "queries/*.scm", "grammar.js"]
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tree-sitter = "0.26"

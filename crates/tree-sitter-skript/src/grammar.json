@@ -1,0 +1,2586 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
+  "name": "skript",
+  "rules": {
+    "source_file": {
+      "type": "REPEAT",
+      "content": {
+        "type": "SYMBOL",
+        "name": "_item"
+      }
+    },
+    "_item": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "comment_todo"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "comment_note"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "comment"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "string"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "option_ref"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "variable"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "interpolation"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "event"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "command"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "section"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "meta_key"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "boolean_true"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "boolean_false"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "stop"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "control"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "loop_object"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "gui"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "inventory"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "player_object"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "time_unit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "effect"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "expression"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "connector"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "color_code_bare"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "color_name"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "number"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "border"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "operator"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "word"
+        }
+      ]
+    },
+    "comment_todo": {
+      "type": "TOKEN",
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "#!!"
+          },
+          {
+            "type": "PATTERN",
+            "value": "[^\\n]*"
+          }
+        ]
+      }
+    },
+    "comment_note": {
+      "type": "TOKEN",
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "#!"
+          },
+          {
+            "type": "PATTERN",
+            "value": "[^\\n]*"
+          }
+        ]
+      }
+    },
+    "comment": {
+      "type": "TOKEN",
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "#"
+          },
+          {
+            "type": "PATTERN",
+            "value": "[^\\n]*"
+          }
+        ]
+      }
+    },
+    "string": {
+      "type": "PREC_RIGHT",
+      "value": 0,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "\""
+          },
+          {
+            "type": "REPEAT",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "option_ref_inner"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "variable_inner"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "interpolation_inner"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "color_code"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "string_text"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "string_marker"
+                }
+              ]
+            }
+          },
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "STRING",
+                "value": "\""
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "string_text": {
+      "type": "IMMEDIATE_TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 5,
+        "content": {
+          "type": "PATTERN",
+          "value": "[^\"%&§<{\\n]+"
+        }
+      }
+    },
+    "interpolation_inner": {
+      "type": "IMMEDIATE_TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 5,
+        "content": {
+          "type": "PATTERN",
+          "value": "%[^%\\n]*%"
+        }
+      }
+    },
+    "color_code": {
+      "type": "IMMEDIATE_TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 5,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "PATTERN",
+              "value": "[&§][0-9a-fk-orA-FK-OR]"
+            },
+            {
+              "type": "PATTERN",
+              "value": "<[a-zA-Z ]+>"
+            }
+          ]
+        }
+      }
+    },
+    "option_ref_inner": {
+      "type": "IMMEDIATE_TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 6,
+        "content": {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "{@"
+            },
+            {
+              "type": "PATTERN",
+              "value": "[^}\\n]*"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "}"
+                },
+                {
+                  "type": "BLANK"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "variable_inner": {
+      "type": "IMMEDIATE_TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 5,
+        "content": {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "{"
+            },
+            {
+              "type": "PATTERN",
+              "value": "[^}\\n]*"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "}"
+                },
+                {
+                  "type": "BLANK"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "string_marker": {
+      "type": "IMMEDIATE_TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 4,
+        "content": {
+          "type": "PATTERN",
+          "value": "[%&§<{]"
+        }
+      }
+    },
+    "option_ref": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "{@"
+            },
+            {
+              "type": "PATTERN",
+              "value": "[^}\\n]*"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "}"
+                },
+                {
+                  "type": "BLANK"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "variable": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "{"
+            },
+            {
+              "type": "PATTERN",
+              "value": "[^}\\n]*"
+            },
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "}"
+                },
+                {
+                  "type": "BLANK"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "interpolation": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PATTERN",
+        "value": "%[^%\\n]*%"
+      }
+    },
+    "event": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 3,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "PATTERN",
+                  "value": "on [a-zA-Z]"
+                },
+                {
+                  "type": "PATTERN",
+                  "value": "[^\\n:]*"
+                },
+                {
+                  "type": "STRING",
+                  "value": ":"
+                }
+              ]
+            },
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "PATTERN",
+                  "value": "every "
+                },
+                {
+                  "type": "PATTERN",
+                  "value": "[^\\n:]*"
+                },
+                {
+                  "type": "STRING",
+                  "value": ":"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "command": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 3,
+        "content": {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "command "
+            },
+            {
+              "type": "PATTERN",
+              "value": "[^\\n:]*"
+            },
+            {
+              "type": "STRING",
+              "value": ":"
+            }
+          ]
+        }
+      }
+    },
+    "section": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 3,
+        "content": {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "options"
+                },
+                {
+                  "type": "STRING",
+                  "value": "variables"
+                },
+                {
+                  "type": "STRING",
+                  "value": "aliases"
+                },
+                {
+                  "type": "STRING",
+                  "value": "import"
+                }
+              ]
+            },
+            {
+              "type": "PATTERN",
+              "value": "[ \\t]*"
+            },
+            {
+              "type": "STRING",
+              "value": ":"
+            }
+          ]
+        }
+      }
+    },
+    "meta_key": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "description"
+                },
+                {
+                  "type": "STRING",
+                  "value": "usage"
+                },
+                {
+                  "type": "STRING",
+                  "value": "permission message"
+                },
+                {
+                  "type": "STRING",
+                  "value": "permission"
+                },
+                {
+                  "type": "STRING",
+                  "value": "executable by"
+                },
+                {
+                  "type": "STRING",
+                  "value": "trigger"
+                },
+                {
+                  "type": "STRING",
+                  "value": "cooldown message"
+                },
+                {
+                  "type": "STRING",
+                  "value": "cooldown bypass"
+                },
+                {
+                  "type": "STRING",
+                  "value": "cooldown storage"
+                },
+                {
+                  "type": "STRING",
+                  "value": "cooldown"
+                },
+                {
+                  "type": "STRING",
+                  "value": "patterns"
+                },
+                {
+                  "type": "STRING",
+                  "value": "check"
+                },
+                {
+                  "type": "STRING",
+                  "value": "parse"
+                },
+                {
+                  "type": "STRING",
+                  "value": "loop of"
+                }
+              ]
+            },
+            {
+              "type": "PATTERN",
+              "value": "[ \\t]*"
+            },
+            {
+              "type": "STRING",
+              "value": ":"
+            }
+          ]
+        }
+      }
+    },
+    "boolean_true": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "STRING",
+          "value": "true"
+        }
+      }
+    },
+    "boolean_false": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "STRING",
+          "value": "false"
+        }
+      }
+    },
+    "stop": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "stop trigger"
+            },
+            {
+              "type": "STRING",
+              "value": "stop loop"
+            },
+            {
+              "type": "STRING",
+              "value": "stop section"
+            },
+            {
+              "type": "STRING",
+              "value": "stop conditionals"
+            },
+            {
+              "type": "STRING",
+              "value": "stop"
+            },
+            {
+              "type": "STRING",
+              "value": "exit trigger"
+            },
+            {
+              "type": "STRING",
+              "value": "exit loop"
+            },
+            {
+              "type": "STRING",
+              "value": "exit section"
+            },
+            {
+              "type": "STRING",
+              "value": "exit"
+            },
+            {
+              "type": "STRING",
+              "value": "escape"
+            },
+            {
+              "type": "STRING",
+              "value": "cancel event"
+            },
+            {
+              "type": "STRING",
+              "value": "cancel the event"
+            },
+            {
+              "type": "STRING",
+              "value": "uncancel event"
+            },
+            {
+              "type": "STRING",
+              "value": "uncancel the event"
+            },
+            {
+              "type": "STRING",
+              "value": "break"
+            },
+            {
+              "type": "STRING",
+              "value": "shutdown"
+            }
+          ]
+        }
+      }
+    },
+    "control": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "else if"
+            },
+            {
+              "type": "STRING",
+              "value": "if"
+            },
+            {
+              "type": "STRING",
+              "value": "else"
+            },
+            {
+              "type": "STRING",
+              "value": "while"
+            },
+            {
+              "type": "STRING",
+              "value": "loop"
+            },
+            {
+              "type": "STRING",
+              "value": "return"
+            },
+            {
+              "type": "STRING",
+              "value": "continue loop"
+            },
+            {
+              "type": "STRING",
+              "value": "continue"
+            },
+            {
+              "type": "STRING",
+              "value": "for"
+            },
+            {
+              "type": "STRING",
+              "value": "function"
+            },
+            {
+              "type": "STRING",
+              "value": "contains"
+            },
+            {
+              "type": "STRING",
+              "value": "contain"
+            },
+            {
+              "type": "STRING",
+              "value": "doesn't"
+            },
+            {
+              "type": "STRING",
+              "value": "does not"
+            },
+            {
+              "type": "STRING",
+              "value": "does"
+            },
+            {
+              "type": "STRING",
+              "value": "isn't"
+            },
+            {
+              "type": "STRING",
+              "value": "is not"
+            },
+            {
+              "type": "STRING",
+              "value": "is"
+            },
+            {
+              "type": "STRING",
+              "value": "aren't"
+            },
+            {
+              "type": "STRING",
+              "value": "are not"
+            },
+            {
+              "type": "STRING",
+              "value": "are"
+            },
+            {
+              "type": "STRING",
+              "value": "have"
+            },
+            {
+              "type": "STRING",
+              "value": "has"
+            }
+          ]
+        }
+      }
+    },
+    "effect": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "send message"
+            },
+            {
+              "type": "STRING",
+              "value": "send"
+            },
+            {
+              "type": "STRING",
+              "value": "message"
+            },
+            {
+              "type": "STRING",
+              "value": "broadcast"
+            },
+            {
+              "type": "STRING",
+              "value": "set"
+            },
+            {
+              "type": "STRING",
+              "value": "add"
+            },
+            {
+              "type": "STRING",
+              "value": "give"
+            },
+            {
+              "type": "STRING",
+              "value": "increase"
+            },
+            {
+              "type": "STRING",
+              "value": "remove all"
+            },
+            {
+              "type": "STRING",
+              "value": "remove every"
+            },
+            {
+              "type": "STRING",
+              "value": "remove"
+            },
+            {
+              "type": "STRING",
+              "value": "subtract"
+            },
+            {
+              "type": "STRING",
+              "value": "reduce"
+            },
+            {
+              "type": "STRING",
+              "value": "delete"
+            },
+            {
+              "type": "STRING",
+              "value": "clear"
+            },
+            {
+              "type": "STRING",
+              "value": "reset"
+            },
+            {
+              "type": "STRING",
+              "value": "make"
+            },
+            {
+              "type": "STRING",
+              "value": "ban"
+            },
+            {
+              "type": "STRING",
+              "value": "unban"
+            },
+            {
+              "type": "STRING",
+              "value": "ip-ban"
+            },
+            {
+              "type": "STRING",
+              "value": "ip ban"
+            },
+            {
+              "type": "STRING",
+              "value": "kick"
+            },
+            {
+              "type": "STRING",
+              "value": "kill"
+            },
+            {
+              "type": "STRING",
+              "value": "deop"
+            },
+            {
+              "type": "STRING",
+              "value": "op"
+            },
+            {
+              "type": "STRING",
+              "value": "dye"
+            },
+            {
+              "type": "STRING",
+              "value": "colour"
+            },
+            {
+              "type": "STRING",
+              "value": "color"
+            },
+            {
+              "type": "STRING",
+              "value": "paint"
+            },
+            {
+              "type": "STRING",
+              "value": "open"
+            },
+            {
+              "type": "STRING",
+              "value": "show"
+            },
+            {
+              "type": "STRING",
+              "value": "close"
+            },
+            {
+              "type": "STRING",
+              "value": "reveal"
+            },
+            {
+              "type": "STRING",
+              "value": "hide"
+            },
+            {
+              "type": "STRING",
+              "value": "damage"
+            },
+            {
+              "type": "STRING",
+              "value": "heal"
+            },
+            {
+              "type": "STRING",
+              "value": "repair"
+            },
+            {
+              "type": "STRING",
+              "value": "feed"
+            },
+            {
+              "type": "STRING",
+              "value": "wait"
+            },
+            {
+              "type": "STRING",
+              "value": "halt"
+            },
+            {
+              "type": "STRING",
+              "value": "drop"
+            },
+            {
+              "type": "STRING",
+              "value": "play sound"
+            },
+            {
+              "type": "STRING",
+              "value": "play"
+            },
+            {
+              "type": "STRING",
+              "value": "force"
+            },
+            {
+              "type": "STRING",
+              "value": "load"
+            },
+            {
+              "type": "STRING",
+              "value": "loaded"
+            },
+            {
+              "type": "STRING",
+              "value": "unload"
+            },
+            {
+              "type": "STRING",
+              "value": "unloaded"
+            },
+            {
+              "type": "STRING",
+              "value": "rotate"
+            },
+            {
+              "type": "STRING",
+              "value": "say"
+            },
+            {
+              "type": "STRING",
+              "value": "start"
+            },
+            {
+              "type": "STRING",
+              "value": "enchant"
+            },
+            {
+              "type": "STRING",
+              "value": "disenchant"
+            },
+            {
+              "type": "STRING",
+              "value": "equip"
+            },
+            {
+              "type": "STRING",
+              "value": "wear"
+            },
+            {
+              "type": "STRING",
+              "value": "explosion"
+            },
+            {
+              "type": "STRING",
+              "value": "ignite"
+            },
+            {
+              "type": "STRING",
+              "value": "extinguish"
+            },
+            {
+              "type": "STRING",
+              "value": "strike lightning"
+            },
+            {
+              "type": "STRING",
+              "value": "set fire to"
+            },
+            {
+              "type": "STRING",
+              "value": "light"
+            },
+            {
+              "type": "STRING",
+              "value": "log"
+            },
+            {
+              "type": "STRING",
+              "value": "poison"
+            },
+            {
+              "type": "STRING",
+              "value": "unpoison"
+            },
+            {
+              "type": "STRING",
+              "value": "cure"
+            },
+            {
+              "type": "STRING",
+              "value": "push"
+            },
+            {
+              "type": "STRING",
+              "value": "thrust"
+            },
+            {
+              "type": "STRING",
+              "value": "replace all"
+            },
+            {
+              "type": "STRING",
+              "value": "replace every"
+            },
+            {
+              "type": "STRING",
+              "value": "replace"
+            },
+            {
+              "type": "STRING",
+              "value": "shear"
+            },
+            {
+              "type": "STRING",
+              "value": "unshear"
+            },
+            {
+              "type": "STRING",
+              "value": "shoot"
+            },
+            {
+              "type": "STRING",
+              "value": "let"
+            },
+            {
+              "type": "STRING",
+              "value": "spawn"
+            },
+            {
+              "type": "STRING",
+              "value": "teleport"
+            },
+            {
+              "type": "STRING",
+              "value": "leash"
+            },
+            {
+              "type": "STRING",
+              "value": "unleash"
+            },
+            {
+              "type": "STRING",
+              "value": "lead"
+            },
+            {
+              "type": "STRING",
+              "value": "unlead"
+            },
+            {
+              "type": "STRING",
+              "value": "toggle"
+            },
+            {
+              "type": "STRING",
+              "value": "switch"
+            },
+            {
+              "type": "STRING",
+              "value": "activate"
+            },
+            {
+              "type": "STRING",
+              "value": "deactivate"
+            },
+            {
+              "type": "STRING",
+              "value": "turn on"
+            },
+            {
+              "type": "STRING",
+              "value": "turn off"
+            },
+            {
+              "type": "STRING",
+              "value": "enable"
+            },
+            {
+              "type": "STRING",
+              "value": "disable"
+            },
+            {
+              "type": "STRING",
+              "value": "grow"
+            },
+            {
+              "type": "STRING",
+              "value": "create"
+            },
+            {
+              "type": "STRING",
+              "value": "generate"
+            },
+            {
+              "type": "STRING",
+              "value": "connect"
+            },
+            {
+              "type": "STRING",
+              "value": "run command"
+            },
+            {
+              "type": "STRING",
+              "value": "run cmd"
+            },
+            {
+              "type": "STRING",
+              "value": "run"
+            },
+            {
+              "type": "STRING",
+              "value": "title"
+            },
+            {
+              "type": "STRING",
+              "value": "subtitle"
+            },
+            {
+              "type": "STRING",
+              "value": "action bar"
+            },
+            {
+              "type": "STRING",
+              "value": "actionbar"
+            },
+            {
+              "type": "STRING",
+              "value": "boss bar"
+            },
+            {
+              "type": "STRING",
+              "value": "bossbar"
+            },
+            {
+              "type": "STRING",
+              "value": "write"
+            },
+            {
+              "type": "STRING",
+              "value": "register"
+            },
+            {
+              "type": "STRING",
+              "value": "unregister"
+            },
+            {
+              "type": "STRING",
+              "value": "call"
+            },
+            {
+              "type": "STRING",
+              "value": "save"
+            },
+            {
+              "type": "STRING",
+              "value": "insert"
+            },
+            {
+              "type": "STRING",
+              "value": "append"
+            },
+            {
+              "type": "STRING",
+              "value": "prepend"
+            },
+            {
+              "type": "STRING",
+              "value": "assert"
+            },
+            {
+              "type": "STRING",
+              "value": "async"
+            },
+            {
+              "type": "STRING",
+              "value": "sync"
+            },
+            {
+              "type": "STRING",
+              "value": "end"
+            },
+            {
+              "type": "STRING",
+              "value": "bind"
+            },
+            {
+              "type": "STRING",
+              "value": "convert"
+            },
+            {
+              "type": "STRING",
+              "value": "branch"
+            },
+            {
+              "type": "STRING",
+              "value": "fire"
+            },
+            {
+              "type": "STRING",
+              "value": "destroy"
+            },
+            {
+              "type": "STRING",
+              "value": "download"
+            },
+            {
+              "type": "STRING",
+              "value": "bungeecord connect"
+            },
+            {
+              "type": "STRING",
+              "value": "as op"
+            },
+            {
+              "type": "STRING",
+              "value": "new"
+            },
+            {
+              "type": "STRING",
+              "value": "receive"
+            }
+          ]
+        }
+      }
+    },
+    "expression": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "uncoloured"
+            },
+            {
+              "type": "STRING",
+              "value": "uncolored"
+            },
+            {
+              "type": "STRING",
+              "value": "noncoloured"
+            },
+            {
+              "type": "STRING",
+              "value": "noncolored"
+            },
+            {
+              "type": "STRING",
+              "value": "coloured"
+            },
+            {
+              "type": "STRING",
+              "value": "colored"
+            },
+            {
+              "type": "STRING",
+              "value": "pitch"
+            },
+            {
+              "type": "STRING",
+              "value": "volume"
+            },
+            {
+              "type": "STRING",
+              "value": "yaw"
+            },
+            {
+              "type": "STRING",
+              "value": "normalized"
+            },
+            {
+              "type": "STRING",
+              "value": "normalize"
+            },
+            {
+              "type": "STRING",
+              "value": "angle"
+            },
+            {
+              "type": "STRING",
+              "value": "between"
+            },
+            {
+              "type": "STRING",
+              "value": "random"
+            },
+            {
+              "type": "STRING",
+              "value": "squared length"
+            },
+            {
+              "type": "STRING",
+              "value": "velocity"
+            },
+            {
+              "type": "STRING",
+              "value": "around"
+            },
+            {
+              "type": "STRING",
+              "value": "dot"
+            },
+            {
+              "type": "STRING",
+              "value": "cross"
+            },
+            {
+              "type": "STRING",
+              "value": "amount"
+            },
+            {
+              "type": "STRING",
+              "value": "creative"
+            },
+            {
+              "type": "STRING",
+              "value": "survival"
+            },
+            {
+              "type": "STRING",
+              "value": "spectator"
+            },
+            {
+              "type": "STRING",
+              "value": "adventure"
+            },
+            {
+              "type": "STRING",
+              "value": "named"
+            },
+            {
+              "type": "STRING",
+              "value": "name"
+            },
+            {
+              "type": "STRING",
+              "value": "with name"
+            },
+            {
+              "type": "STRING",
+              "value": "with lore"
+            },
+            {
+              "type": "STRING",
+              "value": "parsed as"
+            },
+            {
+              "type": "STRING",
+              "value": "parse as"
+            },
+            {
+              "type": "STRING",
+              "value": "and"
+            },
+            {
+              "type": "STRING",
+              "value": "permission"
+            },
+            {
+              "type": "STRING",
+              "value": "permissions"
+            },
+            {
+              "type": "STRING",
+              "value": "gamerule"
+            },
+            {
+              "type": "STRING",
+              "value": "rule"
+            },
+            {
+              "type": "STRING",
+              "value": "size"
+            },
+            {
+              "type": "STRING",
+              "value": "empty"
+            },
+            {
+              "type": "STRING",
+              "value": "exists"
+            },
+            {
+              "type": "STRING",
+              "value": "exist"
+            },
+            {
+              "type": "STRING",
+              "value": "played"
+            },
+            {
+              "type": "STRING",
+              "value": "play"
+            },
+            {
+              "type": "STRING",
+              "value": "before"
+            },
+            {
+              "type": "STRING",
+              "value": "server"
+            },
+            {
+              "type": "STRING",
+              "value": "this"
+            },
+            {
+              "type": "STRING",
+              "value": "complete"
+            },
+            {
+              "type": "STRING",
+              "value": "absolute"
+            },
+            {
+              "type": "STRING",
+              "value": "path"
+            },
+            {
+              "type": "STRING",
+              "value": "absorption hearts"
+            },
+            {
+              "type": "STRING",
+              "value": "accepted items"
+            },
+            {
+              "type": "STRING",
+              "value": "tablist"
+            },
+            {
+              "type": "STRING",
+              "value": "group"
+            },
+            {
+              "type": "STRING",
+              "value": "score"
+            },
+            {
+              "type": "STRING",
+              "value": "all"
+            },
+            {
+              "type": "STRING",
+              "value": "hologram"
+            },
+            {
+              "type": "STRING",
+              "value": "holograms"
+            },
+            {
+              "type": "STRING",
+              "value": "of file"
+            },
+            {
+              "type": "STRING",
+              "value": "on file"
+            }
+          ]
+        }
+      }
+    },
+    "type": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "biome"
+            },
+            {
+              "type": "STRING",
+              "value": "block"
+            },
+            {
+              "type": "STRING",
+              "value": "boolean"
+            },
+            {
+              "type": "STRING",
+              "value": "chunk"
+            },
+            {
+              "type": "STRING",
+              "value": "click type"
+            },
+            {
+              "type": "STRING",
+              "value": "click types"
+            },
+            {
+              "type": "STRING",
+              "value": "colour"
+            },
+            {
+              "type": "STRING",
+              "value": "colours"
+            },
+            {
+              "type": "STRING",
+              "value": "color"
+            },
+            {
+              "type": "STRING",
+              "value": "colors"
+            },
+            {
+              "type": "STRING",
+              "value": "damage cause"
+            },
+            {
+              "type": "STRING",
+              "value": "damage causes"
+            },
+            {
+              "type": "STRING",
+              "value": "date"
+            },
+            {
+              "type": "STRING",
+              "value": "difficulty"
+            },
+            {
+              "type": "STRING",
+              "value": "difficulties"
+            },
+            {
+              "type": "STRING",
+              "value": "direction"
+            },
+            {
+              "type": "STRING",
+              "value": "directions"
+            },
+            {
+              "type": "STRING",
+              "value": "enchantment"
+            },
+            {
+              "type": "STRING",
+              "value": "enchantments"
+            },
+            {
+              "type": "STRING",
+              "value": "enchantment type"
+            },
+            {
+              "type": "STRING",
+              "value": "enchantment types"
+            },
+            {
+              "type": "STRING",
+              "value": "experience"
+            },
+            {
+              "type": "STRING",
+              "value": "gamemode"
+            },
+            {
+              "type": "STRING",
+              "value": "game mode"
+            },
+            {
+              "type": "STRING",
+              "value": "gamemodes"
+            },
+            {
+              "type": "STRING",
+              "value": "game modes"
+            },
+            {
+              "type": "STRING",
+              "value": "inventory action"
+            },
+            {
+              "type": "STRING",
+              "value": "inventory actions"
+            },
+            {
+              "type": "STRING",
+              "value": "inventory type"
+            },
+            {
+              "type": "STRING",
+              "value": "inventory types"
+            },
+            {
+              "type": "STRING",
+              "value": "item"
+            },
+            {
+              "type": "STRING",
+              "value": "items"
+            },
+            {
+              "type": "STRING",
+              "value": "itemstack"
+            },
+            {
+              "type": "STRING",
+              "value": "item type"
+            },
+            {
+              "type": "STRING",
+              "value": "item types"
+            },
+            {
+              "type": "STRING",
+              "value": "material"
+            },
+            {
+              "type": "STRING",
+              "value": "materials"
+            },
+            {
+              "type": "STRING",
+              "value": "living entity"
+            },
+            {
+              "type": "STRING",
+              "value": "living entities"
+            },
+            {
+              "type": "STRING",
+              "value": "livingentity"
+            },
+            {
+              "type": "STRING",
+              "value": "livingentities"
+            },
+            {
+              "type": "STRING",
+              "value": "location"
+            },
+            {
+              "type": "STRING",
+              "value": "locations"
+            },
+            {
+              "type": "STRING",
+              "value": "money"
+            },
+            {
+              "type": "STRING",
+              "value": "number"
+            },
+            {
+              "type": "STRING",
+              "value": "numbers"
+            },
+            {
+              "type": "STRING",
+              "value": "num"
+            },
+            {
+              "type": "STRING",
+              "value": "nums"
+            },
+            {
+              "type": "STRING",
+              "value": "object"
+            },
+            {
+              "type": "STRING",
+              "value": "objects"
+            },
+            {
+              "type": "STRING",
+              "value": "offline player"
+            },
+            {
+              "type": "STRING",
+              "value": "offline players"
+            },
+            {
+              "type": "STRING",
+              "value": "offlineplayer"
+            },
+            {
+              "type": "STRING",
+              "value": "potion effect type"
+            },
+            {
+              "type": "STRING",
+              "value": "potion type"
+            },
+            {
+              "type": "STRING",
+              "value": "projectile"
+            },
+            {
+              "type": "STRING",
+              "value": "recipe"
+            },
+            {
+              "type": "STRING",
+              "value": "region"
+            },
+            {
+              "type": "STRING",
+              "value": "regions"
+            },
+            {
+              "type": "STRING",
+              "value": "server icon"
+            },
+            {
+              "type": "STRING",
+              "value": "slot type"
+            },
+            {
+              "type": "STRING",
+              "value": "spawn reason"
+            },
+            {
+              "type": "STRING",
+              "value": "teleport cause"
+            },
+            {
+              "type": "STRING",
+              "value": "text"
+            },
+            {
+              "type": "STRING",
+              "value": "texts"
+            },
+            {
+              "type": "STRING",
+              "value": "string"
+            },
+            {
+              "type": "STRING",
+              "value": "strings"
+            },
+            {
+              "type": "STRING",
+              "value": "time"
+            },
+            {
+              "type": "STRING",
+              "value": "times"
+            },
+            {
+              "type": "STRING",
+              "value": "time period"
+            },
+            {
+              "type": "STRING",
+              "value": "duration"
+            },
+            {
+              "type": "STRING",
+              "value": "durations"
+            },
+            {
+              "type": "STRING",
+              "value": "timespan"
+            },
+            {
+              "type": "STRING",
+              "value": "time span"
+            },
+            {
+              "type": "STRING",
+              "value": "tree type"
+            },
+            {
+              "type": "STRING",
+              "value": "tree"
+            },
+            {
+              "type": "STRING",
+              "value": "trees"
+            },
+            {
+              "type": "STRING",
+              "value": "vector"
+            },
+            {
+              "type": "STRING",
+              "value": "vectors"
+            },
+            {
+              "type": "STRING",
+              "value": "visual effect"
+            },
+            {
+              "type": "STRING",
+              "value": "particle effect"
+            },
+            {
+              "type": "STRING",
+              "value": "weather type"
+            },
+            {
+              "type": "STRING",
+              "value": "weather types"
+            },
+            {
+              "type": "STRING",
+              "value": "weather"
+            },
+            {
+              "type": "STRING",
+              "value": "world"
+            },
+            {
+              "type": "STRING",
+              "value": "worlds"
+            },
+            {
+              "type": "STRING",
+              "value": "integer"
+            },
+            {
+              "type": "STRING",
+              "value": "integers"
+            },
+            {
+              "type": "STRING",
+              "value": "entity type"
+            },
+            {
+              "type": "STRING",
+              "value": "entity types"
+            },
+            {
+              "type": "STRING",
+              "value": "clear"
+            },
+            {
+              "type": "STRING",
+              "value": "sunny"
+            },
+            {
+              "type": "STRING",
+              "value": "sun"
+            },
+            {
+              "type": "STRING",
+              "value": "rainy"
+            },
+            {
+              "type": "STRING",
+              "value": "raining"
+            },
+            {
+              "type": "STRING",
+              "value": "rain"
+            },
+            {
+              "type": "STRING",
+              "value": "thundering"
+            },
+            {
+              "type": "STRING",
+              "value": "thunderstorm"
+            },
+            {
+              "type": "STRING",
+              "value": "thunder"
+            },
+            {
+              "type": "STRING",
+              "value": "int"
+            },
+            {
+              "type": "STRING",
+              "value": "byte"
+            },
+            {
+              "type": "STRING",
+              "value": "pnum"
+            },
+            {
+              "type": "STRING",
+              "value": "pinfo"
+            },
+            {
+              "type": "STRING",
+              "value": "short"
+            },
+            {
+              "type": "STRING",
+              "value": "long"
+            },
+            {
+              "type": "STRING",
+              "value": "float"
+            },
+            {
+              "type": "STRING",
+              "value": "array"
+            },
+            {
+              "type": "STRING",
+              "value": "pjson"
+            },
+            {
+              "type": "STRING",
+              "value": "penum"
+            },
+            {
+              "type": "STRING",
+              "value": "pentity"
+            },
+            {
+              "type": "STRING",
+              "value": "packet"
+            },
+            {
+              "type": "STRING",
+              "value": "packets"
+            }
+          ]
+        }
+      }
+    },
+    "player_object": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "game mode"
+            },
+            {
+              "type": "STRING",
+              "value": "gamemode"
+            },
+            {
+              "type": "STRING",
+              "value": "all players"
+            },
+            {
+              "type": "STRING",
+              "value": "players"
+            },
+            {
+              "type": "STRING",
+              "value": "player"
+            },
+            {
+              "type": "STRING",
+              "value": "victim"
+            },
+            {
+              "type": "STRING",
+              "value": "attacker"
+            },
+            {
+              "type": "STRING",
+              "value": "sender"
+            },
+            {
+              "type": "STRING",
+              "value": "loop-player"
+            },
+            {
+              "type": "STRING",
+              "value": "shooter"
+            },
+            {
+              "type": "STRING",
+              "value": "console"
+            },
+            {
+              "type": "STRING",
+              "value": "uuid of"
+            },
+            {
+              "type": "STRING",
+              "value": "'s uuid"
+            },
+            {
+              "type": "STRING",
+              "value": "location of"
+            }
+          ]
+        }
+      }
+    },
+    "connector": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "at"
+            },
+            {
+              "type": "STRING",
+              "value": "by"
+            },
+            {
+              "type": "STRING",
+              "value": "with"
+            },
+            {
+              "type": "STRING",
+              "value": "from"
+            },
+            {
+              "type": "STRING",
+              "value": "to"
+            },
+            {
+              "type": "STRING",
+              "value": "in"
+            }
+          ]
+        }
+      }
+    },
+    "time_unit": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "ticks"
+            },
+            {
+              "type": "STRING",
+              "value": "tick"
+            },
+            {
+              "type": "STRING",
+              "value": "seconds"
+            },
+            {
+              "type": "STRING",
+              "value": "second"
+            },
+            {
+              "type": "STRING",
+              "value": "minutes"
+            },
+            {
+              "type": "STRING",
+              "value": "minute"
+            },
+            {
+              "type": "STRING",
+              "value": "hours"
+            },
+            {
+              "type": "STRING",
+              "value": "hour"
+            },
+            {
+              "type": "STRING",
+              "value": "days"
+            },
+            {
+              "type": "STRING",
+              "value": "day"
+            },
+            {
+              "type": "STRING",
+              "value": "years"
+            },
+            {
+              "type": "STRING",
+              "value": "year"
+            }
+          ]
+        }
+      }
+    },
+    "loop_object": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "PATTERN",
+          "value": "(loop|event)-[a-zA-Z_][a-zA-Z0-9_]*"
+        }
+      }
+    },
+    "gui": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "gui slot"
+            },
+            {
+              "type": "STRING",
+              "value": "gui"
+            },
+            {
+              "type": "STRING",
+              "value": "slots"
+            },
+            {
+              "type": "STRING",
+              "value": "slot"
+            }
+          ]
+        }
+      }
+    },
+    "inventory": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "current inventory"
+            },
+            {
+              "type": "STRING",
+              "value": "top inventory"
+            },
+            {
+              "type": "STRING",
+              "value": "open inventory"
+            },
+            {
+              "type": "STRING",
+              "value": "inventories"
+            },
+            {
+              "type": "STRING",
+              "value": "inventory"
+            }
+          ]
+        }
+      }
+    },
+    "color_name": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "black"
+            },
+            {
+              "type": "STRING",
+              "value": "dark grey"
+            },
+            {
+              "type": "STRING",
+              "value": "dark gray"
+            },
+            {
+              "type": "STRING",
+              "value": "light grey"
+            },
+            {
+              "type": "STRING",
+              "value": "light gray"
+            },
+            {
+              "type": "STRING",
+              "value": "grey"
+            },
+            {
+              "type": "STRING",
+              "value": "gray"
+            },
+            {
+              "type": "STRING",
+              "value": "silver"
+            },
+            {
+              "type": "STRING",
+              "value": "white"
+            },
+            {
+              "type": "STRING",
+              "value": "dark blue"
+            },
+            {
+              "type": "STRING",
+              "value": "light blue"
+            },
+            {
+              "type": "STRING",
+              "value": "blue"
+            },
+            {
+              "type": "STRING",
+              "value": "dark cyan"
+            },
+            {
+              "type": "STRING",
+              "value": "dark aqua"
+            },
+            {
+              "type": "STRING",
+              "value": "cyan"
+            },
+            {
+              "type": "STRING",
+              "value": "aqua"
+            },
+            {
+              "type": "STRING",
+              "value": "dark green"
+            },
+            {
+              "type": "STRING",
+              "value": "light green"
+            },
+            {
+              "type": "STRING",
+              "value": "lime green"
+            },
+            {
+              "type": "STRING",
+              "value": "lime"
+            },
+            {
+              "type": "STRING",
+              "value": "green"
+            },
+            {
+              "type": "STRING",
+              "value": "light yellow"
+            },
+            {
+              "type": "STRING",
+              "value": "yellow"
+            },
+            {
+              "type": "STRING",
+              "value": "orange"
+            },
+            {
+              "type": "STRING",
+              "value": "gold"
+            },
+            {
+              "type": "STRING",
+              "value": "dark yellow"
+            },
+            {
+              "type": "STRING",
+              "value": "dark red"
+            },
+            {
+              "type": "STRING",
+              "value": "red"
+            },
+            {
+              "type": "STRING",
+              "value": "pink"
+            },
+            {
+              "type": "STRING",
+              "value": "light red"
+            },
+            {
+              "type": "STRING",
+              "value": "dark purple"
+            },
+            {
+              "type": "STRING",
+              "value": "light purple"
+            },
+            {
+              "type": "STRING",
+              "value": "purple"
+            },
+            {
+              "type": "STRING",
+              "value": "magenta"
+            },
+            {
+              "type": "STRING",
+              "value": "brown"
+            },
+            {
+              "type": "STRING",
+              "value": "indigo"
+            }
+          ]
+        }
+      }
+    },
+    "color_code_bare": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 3,
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "PATTERN",
+              "value": "[&§][0-9a-fk-orA-FK-OR]"
+            },
+            {
+              "type": "PATTERN",
+              "value": "<[a-zA-Z ]+>"
+            }
+          ]
+        }
+      }
+    },
+    "number": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PATTERN",
+        "value": "\\d+(\\.\\d+)?"
+      }
+    },
+    "border": {
+      "type": "TOKEN",
+      "content": {
+        "type": "CHOICE",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "::"
+          },
+          {
+            "type": "STRING",
+            "value": ":"
+          },
+          {
+            "type": "STRING",
+            "value": "["
+          },
+          {
+            "type": "STRING",
+            "value": "]"
+          },
+          {
+            "type": "STRING",
+            "value": "("
+          },
+          {
+            "type": "STRING",
+            "value": ")"
+          },
+          {
+            "type": "STRING",
+            "value": "/"
+          },
+          {
+            "type": "STRING",
+            "value": "\\"
+          }
+        ]
+      }
+    },
+    "operator": {
+      "type": "TOKEN",
+      "content": {
+        "type": "CHOICE",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "+"
+          },
+          {
+            "type": "STRING",
+            "value": "-"
+          },
+          {
+            "type": "STRING",
+            "value": "*"
+          },
+          {
+            "type": "STRING",
+            "value": "^"
+          },
+          {
+            "type": "STRING",
+            "value": "!="
+          },
+          {
+            "type": "STRING",
+            "value": "="
+          },
+          {
+            "type": "STRING",
+            "value": ">="
+          },
+          {
+            "type": "STRING",
+            "value": "<="
+          },
+          {
+            "type": "STRING",
+            "value": ">"
+          },
+          {
+            "type": "STRING",
+            "value": "<"
+          },
+          {
+            "type": "STRING",
+            "value": "||"
+          },
+          {
+            "type": "STRING",
+            "value": ","
+          },
+          {
+            "type": "STRING",
+            "value": "."
+          },
+          {
+            "type": "STRING",
+            "value": "?"
+          },
+          {
+            "type": "STRING",
+            "value": "!"
+          },
+          {
+            "type": "STRING",
+            "value": "@"
+          },
+          {
+            "type": "STRING",
+            "value": "$"
+          }
+        ]
+      }
+    },
+    "word": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": -1,
+        "content": {
+          "type": "PATTERN",
+          "value": "[^\\s\"{}%#:\\[\\](),]+"
+        }
+      }
+    }
+  },
+  "extras": [
+    {
+      "type": "PATTERN",
+      "value": "\\s"
+    }
+  ],
+  "conflicts": [],
+  "precedences": [],
+  "externals": [],
+  "inline": [],
+  "supertypes": [],
+  "reserved": {}
+}

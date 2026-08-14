@@ -1,0 +1,43 @@
+[package]
+name = "mf-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MeshFlow UI. The only crate that knows freya exists."
+
+[dependencies]
+mf-engine.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# `markdown-code-editor` is deliberately NOT enabled, and Phase 2 must not turn it on to get
+# syntax highlighting in chat. It routes fenced code blocks through `CodeBlockEditor`, which builds
+# `CodeEditorData::new(..)` hardcoded to `EditorSyntaxTheme::default()` (light) with no public way
+# to override it — code then renders as near-black text on our dark background. Without it,
+# freya-markdown falls back to a rect + label that honours the `background_code` / `color_code`
+# theme tokens. The standalone `code-editor` (Phase 2's editor tab) is themeable via `set_theme`
+# and gets enabled then, together with `Theme::to_freya`'s `with_dark_code_editor()`.
+freya = { version = "0.5.0-rc.2", features = ["markdown", "sdk-tokio", "icons-lucide", "terminal", "code-editor"] }
+
+# Grammars for the editor. `freya-code-editor` deliberately ships none — you bring your own —
+# so each language is an explicit dependency and a C build. These cover what this project and its
+# config are written in; everything else opens as plain text with the editor otherwise fully
+# working. The rest are Phase 5, and are one line each when someone wants them.
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+# Skript, generated from the Sk-VSC TextMate grammar. Local rather than from crates.io because no
+# tree-sitter grammar for Skript exists — see crates/tree-sitter-skript/grammar.js.
+tree-sitter-skript.workspace = true
+
+# Native folder picker. `xdg-portal` only: the portal is a D-Bus call, so this does not link GTK
+# and does not need a toolkit running in-process. It is also the safer shape — the *OS* browses the
+# filesystem under the user's own privileges and hands back one path, so nothing here ever lists a
+# directory outside the sandbox. Typing a path stays available for headless boxes with no portal.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+
+[dev-dependencies]
+# Used only to assert that highlights.scm captures land on the theme slots skript.rs fills.
+tree-sitter = "0.26"
