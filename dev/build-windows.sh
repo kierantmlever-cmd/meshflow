@@ -46,6 +46,7 @@ mkdir -p "$OUT/meshflow"
 cp "$EXE" "$OUT/meshflow/"
 # Its presence is what makes the build portable — see `mf_engine::paths`.
 mkdir -p "$OUT/meshflow/meshflow-data"
+cp "$REPO/dev/portable-marker.txt" "$OUT/meshflow/meshflow-data/README.txt"
 # Shared with the CI workflow rather than written twice — two copies of the same instructions
 # drift, and the one nobody is looking at is the one that ends up in the zip.
 cp "$REPO/dev/portable-README.txt" "$OUT/meshflow/README.txt"

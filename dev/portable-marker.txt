@@ -1,0 +1,10 @@
+This folder is the switch.
+
+While it sits next to meshflow.exe, everything the app writes — config.toml, meshflow.db and the
+logs — stays in here rather than going to %APPDATA%. Move the whole folder to another machine and
+your conversations and settings come with it.
+
+Delete this folder and the same executable goes back to the usual Windows locations.
+
+(This file only exists because the folder has to contain something to survive being zipped up.
+Deleting the file is harmless; deleting the folder is what changes the behaviour.)

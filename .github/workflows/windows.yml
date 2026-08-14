@@ -45,8 +45,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/meshflow | Out-Null
           Copy-Item target/release/meshflow.exe dist/meshflow/
           # Its presence beside the executable is what makes the build portable — see
-          # `mf_engine::paths`. Git cannot carry an empty directory, so it is created here.
+          # `mf_engine::paths`. It needs a file in it: upload-artifact drops empty directories,
+          # so an empty one arrives as no directory at all and the download is not portable.
           New-Item -ItemType Directory -Force -Path dist/meshflow/meshflow-data | Out-Null
+          Copy-Item dev/portable-marker.txt dist/meshflow/meshflow-data/README.txt
           Copy-Item dev/portable-README.txt dist/meshflow/README.txt
 
       - uses: actions/upload-artifact@v4

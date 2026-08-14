@@ -4,6 +4,12 @@
 //! own single-threaded runtime and `#[tokio::main]` interferes with its event loop, so the runtime
 //! is built by hand and entered for the life of the process.
 
+// Windows opens a console window for any binary that does not say otherwise, so a released build
+// would show a black terminal sitting behind the app for its whole life. Release only: a debug
+// build keeps its console, because that is where `cargo run` prints and losing it would mean
+// debugging a GUI with no output at all.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use mf_engine::proto::{EngineCommand, EngineEvent};
 use tokio::sync::{broadcast, mpsc};
 
