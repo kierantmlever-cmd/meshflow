@@ -569,13 +569,32 @@ mod tests {
         assert_eq!(out.content, "hello\nworld\n");
     }
 
+    /// A file that really exists, somewhere no sandbox root covers.
+    ///
+    /// Not `/etc/passwd`: on Windows that path does not resolve at all, so the policy refuses it
+    /// for the wrong reason and the test stops proving the thing it is named after — that the
+    /// *boundary* is what refused it.
+    fn outside_the_sandbox() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("not-yours.txt");
+        std::fs::write(&path, "secret").unwrap();
+        (tmp, path)
+    }
+
     #[tokio::test]
     async fn tools_cannot_escape_the_sandbox() {
         let (_tmp, ctx) = sandbox();
+        let (_elsewhere, outside) = outside_the_sandbox();
         let registry = ToolRegistry::with_builtins();
 
         let err = registry
-            .dispatch("read_file", json!({ "path": "/etc/passwd" }), &ctx, Permission::all(), None)
+            .dispatch(
+                "read_file",
+                json!({ "path": outside.to_str().unwrap() }),
+                &ctx,
+                Permission::all(),
+                None,
+            )
             .await
             .expect_err("reads outside the sandbox must fail");
 
@@ -753,8 +772,9 @@ mod tests {
         // Approving a write that then fails for reasons never shown teaches users the prompt is
         // noise. Better to say it cannot happen while they are still reading.
         let (_tmp, ctx) = sandbox();
+        let (_elsewhere, outside) = outside_the_sandbox();
         let preview = WriteFile
-            .preview(&ctx, &json!({ "path": "/etc/passwd", "content": "x" }))
+            .preview(&ctx, &json!({ "path": outside.to_str().unwrap(), "content": "x" }))
             .await;
 
         assert!(preview.detail.contains("will be refused"), "{}", preview.detail);
