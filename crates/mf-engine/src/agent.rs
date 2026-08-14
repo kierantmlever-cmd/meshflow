@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, oneshot};
 
 use crate::{
+    context,
     proto::{ConvId, EngineEvent, RunId, StopReason, StreamEvent, ToolCallId, Usage},
     provider::{AiProvider, ChatRequest, Message, Part, ProviderError, Role},
     store::{AuditEntry, Store},
@@ -43,25 +44,71 @@ pub struct AgentRun<P: AiProvider> {
     pub registry: Arc<ToolRegistry>,
     pub ctx: Arc<ToolCtx>,
     pub granted: Permission,
+    /// Input tokens of history this model will accept. See [`crate::budget_for`].
+    pub budget: usize,
     pub history: Arc<Mutex<Vec<Message>>>,
     pub pending: PendingApprovals,
     pub events: broadcast::Sender<EngineEvent>,
     /// Tools the user chose "always allow" for, for the life of this process.
+    ///
+    /// Shared with delegated sub-agents on purpose: the button says "always allow this *tool*",
+    /// and re-asking per role would train the user to click through. A sub-agent is still bounded
+    /// by the same path policy and by permissions that only ever narrow, so what it can do with
+    /// the allowance is a subset of what the user already granted.
     pub always_allowed: Arc<Mutex<Vec<String>>>,
+    /// While set, calls that would prompt run without one. Shared with every run in the process,
+    /// so turning it off mid-flight stops the *next* call rather than only new conversations.
+    pub auto_approve: Arc<std::sync::atomic::AtomicBool>,
+    /// Suppresses the events that describe *the* run: `RunStarted`, `Delta`, `RunFinished`.
+    ///
+    /// Set for delegated sub-runs. The UI treats those three as the state of the one run the user
+    /// started — a sub-run's `RunFinished` clears the approval queue and unsticks the composer
+    /// while the parent is still working. Tool and approval events are *not* suppressed: the user
+    /// still has to consent to what a sub-agent does, and the transcript still has to show it.
+    pub quiet: bool,
+    /// The role this run is playing, for events the user sees. `None` is the agent the user is
+    /// addressing; `Some("research")` is a sub-agent it delegated to.
+    pub agent: Option<String>,
 }
 
 impl<P: AiProvider> AgentRun<P> {
-    pub async fn execute(self) {
-        let _ = self.events.send(EngineEvent::RunStarted { run: self.run, conv: self.conv });
+    /// Run the loop to completion, returning the model's last piece of text.
+    ///
+    /// The return value is what a delegated run answers with; the top-level run ignores it,
+    /// having already streamed every word of it to the UI.
+    pub async fn execute(self) -> String {
+        if !self.quiet {
+            let _ = self.events.send(EngineEvent::RunStarted { run: self.run, conv: self.conv });
+        }
 
         let mut total = Usage::default();
         let mut stop = StopReason::EndTurn;
+        let mut answer = String::new();
 
         for _ in 0..MAX_ITERATIONS {
+            // Re-fitted every iteration rather than once per turn: tool results are what blow the
+            // window, and they arrive *inside* the loop. The stored history is left whole — this
+            // trims what is sent, not what the transcript keeps.
+            let messages = {
+                let history = self.history.lock().unwrap();
+                let start = context::fit(&history, self.budget);
+                if start > 0 {
+                    // Mirrored to the in-app log viewer, so a user who notices the model has
+                    // forgotten something earlier can see why.
+                    tracing::info!(
+                        dropped = start,
+                        kept = history.len() - start,
+                        budget = self.budget,
+                        "history trimmed to fit the context window",
+                    );
+                }
+                history[start..].to_vec()
+            };
+
             let req = ChatRequest {
                 model: self.model.clone(),
                 system: Some(self.system.clone()),
-                messages: self.history.lock().unwrap().clone(),
+                messages,
                 tools: self.registry.schemas_for(self.granted),
                 ..Default::default()
             };
@@ -84,6 +131,9 @@ impl<P: AiProvider> AgentRun<P> {
             // dies mid-execution, the transcript still shows what the model asked for.
             let mut assistant = Vec::new();
             if !turn.text.is_empty() {
+                // Kept as *the* answer, overwriting anything said before a tool call: the model's
+                // last word is its conclusion, and a delegated run is judged on that alone.
+                answer = turn.text.clone();
                 assistant.push(Part::Text(turn.text));
             }
             for call in &turn.calls {
@@ -103,13 +153,26 @@ impl<P: AiProvider> AgentRun<P> {
                 break;
             }
 
-            let results = self.run_tools(turn.calls).await;
+            let (results, fatal) = self.run_tools(turn.calls).await;
+            // Committed before the check: an unanswered tool call is what makes the *next*
+            // request invalid, and this history outlives the run.
             let message = Message { role: Role::Tool, content: results };
             self.persist(&message).await;
             self.history.lock().unwrap().push(message);
+
+            if let Some(message) = fatal {
+                tracing::warn!(%message, "run abandoned: the model cannot recover from this");
+                let _ = self
+                    .events
+                    .send(EngineEvent::Error { run: Some(self.run), message });
+                break;
+            }
         }
 
-        let _ = self.events.send(EngineEvent::RunFinished { run: self.run, stop, usage: total });
+        if !self.quiet {
+            let _ = self.events.send(EngineEvent::RunFinished { run: self.run, stop, usage: total });
+        }
+        answer
     }
 
     /// Write a turn to the store, if there is one. A persistence failure is logged and the run
@@ -149,7 +212,9 @@ impl<P: AiProvider> AgentRun<P> {
                 StreamEvent::Done(reason) => turn.stop = *reason,
                 _ => {}
             }
-            let _ = self.events.send(EngineEvent::Delta { run: self.run, event });
+            if !self.quiet {
+                let _ = self.events.send(EngineEvent::Delta { run: self.run, event });
+            }
         }
 
         Ok(turn)
@@ -159,8 +224,13 @@ impl<P: AiProvider> AgentRun<P> {
     ///
     /// Every call gets a result, including failures — a provider rejects the next request if any
     /// tool call is left unanswered, so an error result is mandatory, not optional.
-    async fn run_tools(&self, calls: Vec<PendingCall>) -> Vec<Part> {
+    ///
+    /// The second return value is set when a failure is one the model cannot work around, such as
+    /// delegation nested past its limit. Telling it and looping would just have it retry the same
+    /// call until the iteration budget runs out.
+    async fn run_tools(&self, calls: Vec<PendingCall>) -> (Vec<Part>, Option<String>) {
         let mut results = Vec::new();
+        let mut fatal = None;
 
         for call in calls {
             let id = ToolCallId::new();
@@ -178,6 +248,7 @@ impl<P: AiProvider> AgentRun<P> {
                 run: self.run,
                 call: id,
                 tool: call.name.clone(),
+                agent: self.agent.clone(),
             });
 
             // Written *before* execution, so a tool that hangs or takes the process down is
@@ -197,6 +268,9 @@ impl<P: AiProvider> AgentRun<P> {
                             tool: Some(&call.name),
                             detail: Some(&detail),
                             approved: approval.map(|a| a != Approval::Deny),
+                            // The row has to answer "was anyone actually asked?" — see
+                            // [`Approval::unattended`].
+                            unattended: approval.is_some_and(Approval::unattended),
                             elevated: false,
                             ok: None,
                         })
@@ -216,7 +290,12 @@ impl<P: AiProvider> AgentRun<P> {
                 Ok(out) => (out.content, false, out.summary),
                 // The error text goes back to the model: a denied path or a bad argument is
                 // information it can act on, not a reason to abandon the run.
-                Err(e) => (e.to_string(), true, e.to_string()),
+                Err(e) => {
+                    if !e.is_recoverable() {
+                        fatal = Some(e.to_string());
+                    }
+                    (e.to_string(), true, e.to_string())
+                }
             };
 
             if let (Some(store), Some(audit_id)) = (&self.store, audit_id)
@@ -235,7 +314,7 @@ impl<P: AiProvider> AgentRun<P> {
             results.push(Part::ToolResult { id: call.id, content, is_error });
         }
 
-        results
+        (results, fatal)
     }
 
     /// Ask the user if this call needs it. Returns the decision, or a ready-made error result
@@ -262,6 +341,21 @@ impl<P: AiProvider> AgentRun<P> {
         if !tool.needs_approval(args) {
             return Ok(None);
         }
+
+        // Checked per call, not once per run: the user can turn the mode off while a run is in
+        // flight, and the next destructive call must stop for them.
+        if self.auto_approve.load(std::sync::atomic::Ordering::SeqCst) {
+            // `warn`, not `info`. A write or a shell command running with nobody watching is the
+            // line this app is otherwise built around, and the log is what makes it reviewable
+            // afterwards.
+            tracing::warn!(
+                tool = name,
+                agent = self.agent.as_deref().unwrap_or("main"),
+                "auto-approved — auto-approve mode is on",
+            );
+            return Ok(Some(Approval::Auto));
+        }
+
         if self.always_allowed.lock().unwrap().iter().any(|t| t == name) {
             // Logged: a destructive tool running without a prompt must be explicable afterwards,
             // and "I don't remember choosing that" is exactly the complaint this answers.
@@ -277,6 +371,7 @@ impl<P: AiProvider> AgentRun<P> {
             run: self.run,
             call: id,
             tool: name.to_owned(),
+            agent: self.agent.clone(),
             preview: tool.preview(&self.ctx, args).await,
         });
 
@@ -333,6 +428,8 @@ mod tests {
     /// Replays canned turns so the loop can be tested without a network or a model.
     struct ScriptedProvider {
         turns: Mutex<Vec<Vec<StreamEvent>>>,
+        /// Messages in each request, in order — what the provider actually got sent.
+        sent: Mutex<Vec<usize>>,
     }
 
     impl AiProvider for ScriptedProvider {
@@ -347,8 +444,9 @@ mod tests {
         }
         async fn stream(
             &self,
-            _req: ChatRequest,
+            req: ChatRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+            self.sent.lock().unwrap().push(req.messages.len());
             let turn = {
                 let mut turns = self.turns.lock().unwrap();
                 if turns.is_empty() { Vec::new() } else { turns.remove(0) }
@@ -361,6 +459,7 @@ mod tests {
         events: broadcast::Sender<EngineEvent>,
         pending: PendingApprovals,
         history: Arc<Mutex<Vec<Message>>>,
+        provider: Arc<ScriptedProvider>,
         _tmp: tempfile::TempDir,
     }
 
@@ -370,12 +469,14 @@ mod tests {
         let (events, _) = broadcast::channel(256);
         let pending: PendingApprovals = Arc::default();
         let history = Arc::new(Mutex::new(vec![Message::user("go")]));
+        let provider =
+            Arc::new(ScriptedProvider { turns: Mutex::new(turns), sent: Mutex::default() });
 
         let run = AgentRun {
             run: RunId::new(),
             conv: ConvId::new(),
             store: None,
-            provider: Arc::new(ScriptedProvider { turns: Mutex::new(turns) }),
+            provider: Arc::clone(&provider),
             model: "test".into(),
             system: "sys".into(),
             registry: Arc::new(ToolRegistry::with_builtins()),
@@ -383,15 +484,20 @@ mod tests {
                 policy: PathPolicy::new(AccessMode::WorkspaceSandbox, [root.clone()], true),
                 cwd: root,
                 depth: 0,
+                delegate: None,
             }),
             granted: Permission::all(),
+            budget: 100_000,
             history: Arc::clone(&history),
             pending: Arc::clone(&pending),
             events: events.clone(),
             always_allowed: Arc::default(),
+            auto_approve: Arc::default(),
+            quiet: false,
+            agent: None,
         };
 
-        (run, Harness { events, pending, history, _tmp: tmp })
+        (run, Harness { events, pending, history, provider, _tmp: tmp })
     }
 
     fn tool_turn(id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
@@ -443,6 +549,7 @@ mod tests {
             policy: PathPolicy::new(AccessMode::WorkspaceSandbox, [path.clone()], true),
             cwd: path,
             depth: 0,
+            delegate: None,
         });
 
         run.execute().await;
@@ -517,6 +624,64 @@ mod tests {
             .expect("denial produces a tool result");
         assert!(is_error);
         assert!(content.contains("denied"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn auto_approve_runs_a_destructive_call_without_asking() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("written.txt");
+        let (mut run, h) = harness(vec![
+            tool_turn(
+                "c1",
+                "write_file",
+                &json!({ "path": path.to_str().unwrap(), "content": "hello" }).to_string(),
+            ),
+            vec![StreamEvent::Done(StopReason::EndTurn)],
+        ]);
+        run.ctx = Arc::new(ToolCtx {
+            policy: PathPolicy::new(AccessMode::WorkspaceSandbox, [dir.clone()], true),
+            cwd: dir,
+            depth: 0,
+            delegate: None,
+        });
+        run.auto_approve.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut rx = h.events.subscribe();
+
+        // Completes with nobody answering anything — that is the whole feature.
+        run.execute().await;
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, EngineEvent::ApprovalNeeded { .. }),
+                "auto-approve must not still be prompting",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn turning_auto_approve_off_stops_the_next_call_mid_run() {
+        // The flag is read per call, not once per run, so a user who turns it off while an agent
+        // is working is not ignored until the next conversation.
+        let (run, h) = harness(vec![
+            tool_turn("c1", "write_file", &json!({ "path": "n.txt", "content": "x" }).to_string()),
+            vec![StreamEvent::Done(StopReason::EndTurn)],
+        ]);
+        run.auto_approve.store(true, std::sync::atomic::Ordering::SeqCst);
+        let flag = Arc::clone(&run.auto_approve);
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let mut rx = h.events.subscribe();
+        let pending = Arc::clone(&h.pending);
+        let task = tokio::spawn(run.execute());
+
+        loop {
+            if let EngineEvent::ApprovalNeeded { call, .. } = rx.recv().await.unwrap() {
+                pending.lock().unwrap().remove(&call).unwrap().send(Approval::Deny).unwrap();
+                break;
+            }
+        }
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -597,6 +762,120 @@ mod tests {
             })
             .expect("malformed arguments still produce a result");
         assert!(content.contains("missing required string field"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn a_history_over_budget_is_trimmed_before_it_reaches_the_provider() {
+        let (mut run, h) = harness(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done(StopReason::EndTurn),
+        ]]);
+        run.budget = 1_000;
+        // Ten user turns of ~1000 tokens each, so only the newest can fit.
+        *h.history.lock().unwrap() =
+            (0..10).map(|i| Message::user(format!("{i}{}", "x".repeat(4_000)))).collect();
+
+        run.execute().await;
+
+        let sent = h.provider.sent.lock().unwrap().clone();
+        assert_eq!(sent, vec![1], "the provider must see the trimmed slice, not the whole history");
+        // Trimming shapes the request only — the transcript keeps every turn.
+        assert_eq!(h.history.lock().unwrap().len(), 11, "10 user turns + the reply");
+    }
+
+    #[tokio::test]
+    async fn an_unrecoverable_tool_error_stops_the_run_instead_of_looping() {
+        // Past the delegation limit every tool refuses, and no amount of retrying changes that —
+        // without this the model spends all 25 iterations being told the same thing.
+        let (mut run, h) = harness(vec![
+            tool_turn("c1", "list_dir", &json!({ "path": "." }).to_string()),
+            tool_turn("c2", "list_dir", &json!({ "path": "." }).to_string()),
+        ]);
+        run.ctx = Arc::new(ToolCtx {
+            policy: PathPolicy::new(AccessMode::WorkspaceSandbox, [run.ctx.cwd.clone()], true),
+            cwd: run.ctx.cwd.clone(),
+            depth: crate::tool::MAX_DELEGATION_DEPTH + 1,
+            delegate: None,
+        });
+        let mut rx = h.events.subscribe();
+
+        run.execute().await;
+
+        // The tool result is still recorded — an unanswered call would make the stored
+        // conversation unusable — but the loop stops after the first round.
+        let calls = h.provider.sent.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "the run kept going after an unrecoverable error");
+
+        let mut reported = false;
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::Error { message, .. } = event {
+                assert!(message.contains("nested too deeply"), "{message}");
+                reported = true;
+            }
+        }
+        assert!(reported, "the user is told why the run stopped");
+    }
+
+    #[tokio::test]
+    async fn a_sub_agents_prompts_name_the_agent_that_is_asking() {
+        let (mut run, h) = harness(vec![
+            tool_turn("c1", "write_file", &json!({ "path": "n.txt", "content": "x" }).to_string()),
+            vec![StreamEvent::Done(StopReason::EndTurn)],
+        ]);
+        run.agent = Some("research".into());
+        let mut rx = h.events.subscribe();
+        let pending = Arc::clone(&h.pending);
+        let task = tokio::spawn(run.execute());
+
+        let mut labelled = 0;
+        loop {
+            match rx.recv().await.unwrap() {
+                EngineEvent::ApprovalNeeded { call, agent, .. } => {
+                    // Consenting to a write from an agent the user never addressed is a
+                    // different decision, so the modal has to be able to say so.
+                    assert_eq!(agent.as_deref(), Some("research"));
+                    labelled += 1;
+                    pending.lock().unwrap().remove(&call).unwrap().send(Approval::Allow).unwrap();
+                }
+                EngineEvent::ToolStarted { agent, .. } => {
+                    assert_eq!(agent.as_deref(), Some("research"));
+                    labelled += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        task.await.unwrap();
+        assert_eq!(labelled, 2);
+    }
+
+    #[tokio::test]
+    async fn a_quiet_run_reports_its_tools_but_not_its_lifecycle() {
+        let (mut run, h) = harness(vec![
+            tool_turn("c1", "list_dir", &json!({ "path": "." }).to_string()),
+            vec![StreamEvent::TextDelta("found it".into()), StreamEvent::Done(StopReason::EndTurn)],
+        ]);
+        run.quiet = true;
+        let mut rx = h.events.subscribe();
+
+        let answer = run.execute().await;
+        assert_eq!(answer, "found it", "a delegated run is judged on its last message");
+
+        let mut tool_events = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                // These three are how the UI tracks *the* run the user started. A sub-run
+                // emitting RunFinished would clear the parent's pending approvals.
+                EngineEvent::RunStarted { .. }
+                | EngineEvent::RunFinished { .. }
+                | EngineEvent::Delta { .. } => panic!("a quiet run leaked {event:?}"),
+                EngineEvent::ToolStarted { .. } | EngineEvent::ToolFinished { .. } => {
+                    tool_events += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(tool_events, 2, "what a sub-agent does must still reach the transcript");
     }
 
     #[tokio::test]

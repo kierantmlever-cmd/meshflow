@@ -19,9 +19,10 @@ use tracing_subscriber::{EnvFilter, Layer, layer::Context, prelude::*};
 
 use crate::proto::{EngineEvent, LogLevel, LogRecord};
 
-/// `~/.local/share/meshflow/logs` on Linux, the platform equivalent elsewhere.
+/// `~/.local/share/meshflow/logs` on Linux, the platform equivalent elsewhere — or beside the
+/// executable in a portable build. See [`crate::paths`].
 pub fn log_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "meshflow").map(|d| d.data_dir().join("logs"))
+    crate::paths::data_dir().map(|d| d.join("logs"))
 }
 
 /// Install the subscriber. The returned guard flushes the log file on drop, so `main` must hold

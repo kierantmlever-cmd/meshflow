@@ -44,6 +44,10 @@ reqwest = { version = "0.13", default-features = false, features = [
     "system-proxy",
 ] }
 secrecy = "0.10"
+# Workspace search, both literal and pattern — a literal query compiles as its own escaped form,
+# so there is one matcher rather than two. Linear-time by construction, which is what makes it
+# safe to hand a pattern typed by a user (or produced by a model) straight to it.
+regex = "1"
 # Myers diff for the write-approval modal. A hand-rolled line comparison is easy to write and
 # easy to get subtly wrong, and a misleading diff on a consent screen is the worst kind of bug.
 similar = "2"

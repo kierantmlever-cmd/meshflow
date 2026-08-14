@@ -41,9 +41,7 @@ pub struct Store {
 impl Store {
     /// Open the user's database, creating and migrating it if needed.
     pub async fn open_default() -> Result<Self, StoreError> {
-        let dir = directories::ProjectDirs::from("", "", "meshflow")
-            .map(|d| d.data_dir().to_path_buf())
-            .ok_or(StoreError::NoDataDir)?;
+        let dir = crate::paths::data_dir().ok_or(StoreError::NoDataDir)?;
         std::fs::create_dir_all(&dir)
             .map_err(|source| StoreError::Io { path: dir.display().to_string(), source })?;
         Self::open(&dir.join("meshflow.db")).await
@@ -241,14 +239,15 @@ impl Store {
     /// is still attributable afterwards.
     pub async fn audit(&self, entry: AuditEntry<'_>) -> Result<i64, StoreError> {
         let id = sqlx::query(
-            "INSERT INTO audit_log (ts, action, tool, detail, approved, elevated, ok) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO audit_log (ts, action, tool, detail, approved, unattended, elevated, ok) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(now())
         .bind(entry.action)
         .bind(entry.tool)
         .bind(entry.detail)
         .bind(entry.approved.map(|a| a as i64))
+        .bind(entry.unattended as i64)
         .bind(entry.elevated as i64)
         .bind(entry.ok.map(|o| o as i64))
         .execute(&self.pool)
@@ -269,7 +268,7 @@ impl Store {
 
     pub async fn recent_audit(&self, limit: i64) -> Result<Vec<AuditRow>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, ts, action, tool, detail, approved, elevated, ok \
+            "SELECT id, ts, action, tool, detail, approved, unattended, elevated, ok \
              FROM audit_log ORDER BY id DESC LIMIT ?",
         )
         .bind(limit)
@@ -285,6 +284,7 @@ impl Store {
                 tool: r.get("tool"),
                 detail: r.get("detail"),
                 approved: r.get::<Option<i64>, _>("approved").map(|v| v != 0),
+                unattended: r.get::<i64, _>("unattended") != 0,
                 elevated: r.get::<i64, _>("elevated") != 0,
                 ok: r.get::<Option<i64>, _>("ok").map(|v| v != 0),
             })
@@ -297,6 +297,10 @@ pub struct AuditEntry<'a> {
     pub tool: Option<&'a str>,
     pub detail: Option<&'a str>,
     pub approved: Option<bool>,
+    /// True when the call ran without a prompt — auto-approve mode, or a tool the user had
+    /// already waved through for the session. `approved = true` on its own cannot tell those
+    /// apart from a decision someone actually read and made.
+    pub unattended: bool,
     pub elevated: bool,
     pub ok: Option<bool>,
 }
@@ -309,6 +313,7 @@ pub struct AuditRow {
     pub tool: Option<String>,
     pub detail: Option<String>,
     pub approved: Option<bool>,
+    pub unattended: bool,
     pub elevated: bool,
     pub ok: Option<bool>,
 }
@@ -448,6 +453,7 @@ mod tests {
                 tool: Some("run_command"),
                 detail: Some("rm -rf ./build"),
                 approved: Some(true),
+                unattended: false,
                 elevated: false,
                 ok: None, // not finished yet
             })
@@ -475,7 +481,8 @@ mod tests {
                     tool: Some("read_file"),
                     detail: Some(&format!("file {i}")),
                     approved: None,
-                    elevated: false,
+                    unattended: false,
+                elevated: false,
                     ok: Some(true),
                 })
                 .await

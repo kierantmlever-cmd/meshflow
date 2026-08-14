@@ -48,6 +48,11 @@ pub struct ProviderEntry {
     pub kind: ProviderKind,
     pub base_url: String,
     pub model: String,
+    /// Input tokens `model` accepts, as the provider reported it when the model was picked.
+    /// `None` for a model typed by hand or an endpoint that does not publish the number — the
+    /// engine falls back to a conservative default rather than guessing high.
+    #[serde(default)]
+    pub context_window: Option<u32>,
     /// Whether a key is expected in the keychain. Local endpoints legitimately have none.
     #[serde(default = "yes")]
     pub needs_key: bool,
@@ -94,9 +99,7 @@ impl Default for ThemeConfig {
 impl Config {
     /// `~/.config/meshflow` on Linux, the platform equivalent elsewhere.
     pub fn dir() -> Result<PathBuf, ConfigError> {
-        directories::ProjectDirs::from("", "", "meshflow")
-            .map(|d| d.config_dir().to_path_buf())
-            .ok_or(ConfigError::NoConfigDir)
+        crate::paths::config_dir().ok_or(ConfigError::NoConfigDir)
     }
 
     pub fn path() -> Result<PathBuf, ConfigError> {
@@ -163,6 +166,7 @@ mod tests {
                 kind: ProviderKind::OpenAi,
                 base_url: "https://api.openai.com/v1".into(),
                 model: "gpt-4o-mini".into(),
+                context_window: Some(128_000),
                 needs_key: true,
                 org_id: None,
                 headers: Default::default(),

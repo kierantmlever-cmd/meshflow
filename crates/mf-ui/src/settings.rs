@@ -89,6 +89,14 @@ impl Component for SettingsView {
         let mut name = use_state(String::new);
         let mut base_url = use_state(String::new);
         let mut model = use_state(String::new);
+        // The context window the provider reported, paired with the model id it belongs to. The
+        // pairing is what makes it self-invalidating: type over a picked id and the window no
+        // longer matches, so it is dropped rather than saved against the wrong model.
+        let mut context_window = use_state(|| None::<(String, u32)>);
+        let window_for = move |id: &str| match &*context_window.read() {
+            Some((picked, window)) if picked == id => Some(*window),
+            _ => None,
+        };
         // Kept apart from everything else so no struct holding form data ever holds the secret.
         let mut key = use_state(String::new);
         let mut kind = use_state(ProviderKind::default);
@@ -97,6 +105,10 @@ impl Component for SettingsView {
         let mut editing = use_state(|| None::<String>);
         let mut notice = use_state(String::new);
         let mut picking = use_state(|| false);
+        // True once the switch has been flipped but before the warning has been accepted. The
+        // flip alone must not arm it: this is the one control in the app that turns off every
+        // other consent screen.
+        let arming = use_state(|| false);
         let flagships_only = use_state(|| true);
 
         // The list is engine-owned; ask for it once on open rather than caching a copy that can
@@ -112,6 +124,7 @@ impl Component for SettingsView {
             name.set(String::new());
             base_url.set(String::new());
             model.set(String::new());
+            context_window.set(None);
             key.set(String::new());
             kind.set(ProviderKind::default());
             needs_key.set(true);
@@ -127,6 +140,7 @@ impl Component for SettingsView {
             name: name.read().trim().to_owned(),
             kind: *kind.read(),
             base_url: base_url.read().trim().to_owned(),
+            context_window: window_for(model.read().trim()),
             model: model.read().trim().to_owned(),
             needs_key: *needs_key.read(),
             org_id: None,
@@ -148,6 +162,7 @@ impl Component for SettingsView {
             name.set(s.entry.name.clone());
             base_url.set(s.entry.base_url.clone());
             model.set(s.entry.model.clone());
+            context_window.set(s.entry.context_window.map(|w| (s.entry.model.clone(), w)));
             kind.set(s.entry.kind);
             needs_key.set(s.entry.needs_key);
             editing.set(Some(s.entry.name.clone()));
@@ -183,6 +198,7 @@ impl Component for SettingsView {
                         name: entry_name.clone(),
                         kind: *kind.read(),
                         base_url: url,
+                        context_window: window_for(&model_id),
                         model: model_id,
                         needs_key: *needs_key.read(),
                         org_id: None,
@@ -248,6 +264,14 @@ impl Component for SettingsView {
                 // First on the screen: which directory an agent may touch matters more than which
                 // model it talks to, and the answer should be visible before anything is typed.
                 .child(crate::workspace::WorkspaceSection)
+                .child(heading(&theme, "Approvals"))
+                .child(approvals_section(
+                    &theme,
+                    &bridge,
+                    *state.auto_approve.read(),
+                    arming,
+                    &state.workspace.read(),
+                ))
                 .child(heading(&theme, "Providers"))
                 .map((!keychain).then_some(()), |root, ()| {
                     // Said before a key is typed, not after it fails to save.
@@ -363,7 +387,8 @@ impl Component for SettingsView {
                         &fetched,
                         model,
                         flagships_only,
-                        move |chosen| {
+                        move |chosen, window| {
+                            context_window.set(window.map(|w| (chosen.clone(), w)));
                             model.set(chosen);
                             picking.set(false);
                         },
@@ -493,7 +518,9 @@ fn model_picker(
     all: &[ModelInfo],
     model: State<String>,
     mut flagships_only: State<bool>,
-    choose: impl FnMut(String) + Clone + 'static,
+    // Takes the reported window with the id: the engine sizes its history budget from it, and
+    // this list is the only place it is ever known.
+    choose: impl FnMut(String, Option<u32>) + Clone + 'static,
 ) -> impl IntoElement {
     let filtering = all.len() > CLUTTER_THRESHOLD;
     let (visible, hidden) = visible_models(all, *flagships_only.read(), &model.read());
@@ -502,6 +529,7 @@ fn model_picker(
         .iter()
         .map(|m| {
             let id = m.id.clone();
+            let window = m.context_window;
             let mut choose = choose.clone();
             let context = m
                 .context_window
@@ -521,7 +549,7 @@ fn model_picker(
                 .content(Content::flex())
                 .child(
                     Button::new()
-                        .on_press(move |_| choose(id.clone()))
+                        .on_press(move |_| choose(id.clone(), window))
                         .child(m.id.clone())
                         .into_element(),
                 )
@@ -681,6 +709,114 @@ fn provider_row(
         })
         .child(Button::new().on_press(move |_| load_entry(&owned)).child("Edit"))
         .child(Button::new().on_press(delete).child("Delete"))
+}
+
+/// The auto-approve control.
+///
+/// Arming it takes two deliberate acts — flip, then read, then confirm — and disarming takes one,
+/// because the asymmetry is the point: the safe direction should never be harder than the
+/// dangerous one. The warning names what is actually being given up *and* what is not, since a
+/// warning that overstates the danger gets clicked through as fast as one that understates it.
+fn approvals_section(
+    theme: &Theme,
+    bridge: &Bridge,
+    on: bool,
+    mut arming: State<bool>,
+    workspace: &std::path::Path,
+) -> impl IntoElement {
+    // Plain function of the value, not an event handler factory: the buttons and the switch all
+    // route through this one line, so there is a single place the mode is ever changed.
+    let send = {
+        let cmd_tx = bridge.cmd_tx.clone();
+        move |value: bool| {
+            let _ = cmd_tx.send(EngineCommand::SetAutoApprove(value));
+            arming.set(false);
+        }
+    };
+
+    rect()
+        .width(Size::fill())
+        .direction(Direction::Vertical)
+        .spacing(theme.gap(10.))
+        .child(field(
+            theme,
+            "Auto-approve",
+            rect()
+                .direction(Direction::Horizontal)
+                .cross_align(Alignment::Center)
+                .spacing(theme.gap(10.))
+                .child(Switch::new().toggled(on || *arming.read()).on_toggle({
+                    let mut send = send.clone();
+                    move |_| {
+                        // Off is immediate. On only opens the warning below — the flip itself
+                        // arms nothing.
+                        if on {
+                            send(false);
+                        } else {
+                            let next = !*arming.read();
+                            arming.set(next);
+                        }
+                    }
+                }))
+                .child(
+                    label()
+                        .color(if on { theme.danger } else { theme.text_dim })
+                        .font_size(theme.font_size - 1.)
+                        // Three states, not two. While arming, the switch reads as on and the
+                        // mode is not — saying "Off" there is the kind of small lie that makes
+                        // someone stop trusting the indicator entirely.
+                        .text(match (on, *arming.read()) {
+                            (true, _) => "ON — tool calls are running without asking",
+                            (false, true) => "Not on yet — read the warning and confirm below",
+                            (false, false) => "Off — every destructive call stops for your approval",
+                        }),
+                )
+                .into_element(),
+        ))
+        .map((!on && *arming.read()).then_some(()), |root, ()| {
+            root.child(
+                rect()
+                    .width(Size::fill())
+                    .direction(Direction::Vertical)
+                    .spacing(theme.gap(10.))
+                    .padding(theme.gap(12.))
+                    .corner_radius(8.)
+                    .background(theme.surface)
+                    .child(
+                        label().color(theme.danger).font_size(theme.font_size + 1.).text(
+                            "Turning this on means agents overwrite files and run shell commands \
+                             with no prompt and no chance to say no.",
+                        ),
+                    )
+                    .child(label().color(theme.text).text(format!(
+                        "Still true with it on: agents stay inside {}, credentials, SSH keys and \
+                         .env files are still refused, and every call is still written to the \
+                         audit log — marked as having run unattended.\n\nIt turns itself off when \
+                         you close MeshFlow.",
+                        workspace.display(),
+                    )))
+                    .child(
+                        rect()
+                            .direction(Direction::Horizontal)
+                            .spacing(theme.gap(8.))
+                            .child(Button::new().on_press({
+                                let mut send = send.clone();
+                                move |_| send(false)
+                            }).child("Cancel"))
+                            // Named after what it does, not "OK" — the button someone clicks by
+                            // reflex should say which way it goes.
+                            .child(
+                                Button::new()
+                                    .filled()
+                                    .on_press({
+                                        let mut send = send.clone();
+                                        move |_| send(true)
+                                    })
+                                    .child("Approve everything automatically"),
+                            ),
+                    ),
+            )
+        })
 }
 
 fn heading(theme: &Theme, text: impl Into<String>) -> impl IntoElement {

@@ -57,6 +57,11 @@ pub struct AppState {
     pub last_error: State<String>,
     /// False when no OS keychain is reachable, so settings can say so before a key is typed.
     pub keychain: State<bool>,
+    /// Whether tool calls are running without prompts. Set only from the engine's own echo, so
+    /// the badge in the header reports what is actually enforced rather than what was last asked
+    /// for — a UI that says the prompts are back while they are not is the worst possible bug
+    /// here.
+    pub auto_approve: State<bool>,
     /// The directory agents are sandboxed to. Shown in the header on every screen, because what
     /// the agent can reach is not something the user should have to go looking for.
     pub workspace: State<PathBuf>,
@@ -77,6 +82,10 @@ pub struct AppState {
     /// The search panel. At the root so a query survives a tab switch — re-walking the workspace
     /// because the user glanced at the terminal would be a slow way to lose their place.
     pub search: State<SearchState>,
+    /// Workspace-relative paths offered when completing an `@` mention. Refreshed each time a
+    /// mention starts rather than held for the session, so a file created five minutes ago is
+    /// in the list.
+    pub workspace_files: State<Vec<PathBuf>>,
 }
 
 /// A provider's model catalogue, tagged with whose it is — a list left over from the previously
@@ -99,6 +108,7 @@ pub fn use_app_state(bridge: &Bridge) -> AppState {
         models: use_state(ModelList::default),
         last_error: use_state(String::new),
         keychain: use_state(|| true),
+        auto_approve: use_state(|| false),
         // The engine's own fallback, so the header is right before the first event arrives
         // rather than blank or wrong.
         workspace: use_state(|| std::env::current_dir().unwrap_or_default()),
@@ -109,6 +119,7 @@ pub fn use_app_state(bridge: &Bridge) -> AppState {
         tabs: use_state(Vec::new),
         active_tab: use_state(|| 0),
         search: use_state(SearchState::default),
+        workspace_files: use_state(Vec::new),
     };
 
     use_hook({
@@ -142,6 +153,7 @@ async fn drain(
         mut models,
         mut last_error,
         mut keychain,
+        mut auto_approve,
         mut workspace,
         mut workspaces,
         mut listings,
@@ -149,6 +161,7 @@ async fn drain(
         mut tabs,
         mut active_tab,
         mut search,
+        mut workspace_files,
         ..
     } = state;
 
@@ -170,13 +183,13 @@ async fn drain(
                 Ok(EngineEvent::Delta { event: StreamEvent::TextDelta(t), .. }) => {
                     pending.push_str(&t);
                 }
-                Ok(EngineEvent::ApprovalNeeded { call, tool, preview, .. }) => {
+                Ok(EngineEvent::ApprovalNeeded { call, tool, agent, preview, .. }) => {
                     // Flush first so the user reads the text that led here before the modal
                     // covers it.
                     flush(&mut pending, messages);
-                    approvals.write().push(PendingApproval { call, tool, preview });
+                    approvals.write().push(PendingApproval { call, tool, agent, preview });
                 }
-                Ok(EngineEvent::ToolStarted { tool, .. }) => {
+                Ok(EngineEvent::ToolStarted { tool, agent, .. }) => {
                     flush(&mut pending, messages);
                     let mut w = messages.write();
                     if w.last().is_some_and(|m| m.streaming && m.text.is_empty()) {
@@ -184,7 +197,12 @@ async fn drain(
                     }
                     w.push(ChatMessage {
                         author: Author::Tool,
-                        text: format!("running `{tool}`…"),
+                        // Attributed, so a burst of tool calls the user did not ask for reads as
+                        // a sub-agent working rather than as the main agent going off on its own.
+                        text: match &agent {
+                            Some(role) => format!("{role} agent · running `{tool}`…"),
+                            None => format!("running `{tool}`…"),
+                        },
                         streaming: true,
                     });
                 }
@@ -259,6 +277,9 @@ async fn drain(
                         // the user never connected to their work. A refused save says why.
                         listings.write().clear();
                         expanded.write().clear();
+                        // Same reason: these paths are relative to the root we have just left,
+                        // and completing one would attach a file from the old workspace.
+                        workspace_files.write().clear();
                     }
                     workspace.set(active);
                     workspaces.set(saved);
@@ -285,6 +306,12 @@ async fn drain(
                         }
                     }
                 }
+                Ok(EngineEvent::AutoApprove(on)) => {
+                    auto_approve.set(on);
+                }
+                Ok(EngineEvent::WorkspaceFiles { files }) => {
+                    workspace_files.set(files);
+                }
                 Ok(EngineEvent::SearchResults { query, results }) => {
                     // Dropped if the query has moved on: a slow search finishing after the user
                     // retyped would replace the newer results with older ones.
@@ -300,9 +327,13 @@ async fn drain(
                     // Every hit it was showing now points at text that is gone, so the list must
                     // not be left standing as if it were still accurate.
                     w.results = Default::default();
-                    let (query, case_sensitive) = (w.query.clone(), w.case_sensitive);
+                    let query = mf_engine::search::Query {
+                        text: w.query.clone(),
+                        case_sensitive: w.case_sensitive,
+                        regex: w.regex,
+                    };
                     drop(w);
-                    let _ = cmd_tx.send(EngineCommand::Search { query, case_sensitive });
+                    let _ = cmd_tx.send(EngineCommand::Search { query });
                 }
                 Ok(EngineEvent::FileSaved { path }) => {
                     if let Some(mut data) =

@@ -98,6 +98,22 @@ impl Component for Shell {
                     // their positions depend on the length of the path, so every workspace switch
                     // moved the tabs out from under the pointer.
                     .child(rect().width(Size::flex(1.)))
+                    // On every tab while it is armed. A mode that silences every consent prompt
+                    // must never be something you have to open Settings to discover is on.
+                    .map(state.auto_approve.read().then_some(()), |root, ()| {
+                        root.child(
+                            rect()
+                                .padding((theme.gap(3.), theme.gap(8.)))
+                                .corner_radius(6.)
+                                .background(theme.danger)
+                                .child(
+                                    label()
+                                        .color(theme.bg)
+                                        .font_size(theme.font_size - 3.)
+                                        .text("AUTO-APPROVE"),
+                                ),
+                        )
+                    })
                     // The sandbox boundary, on every tab. What an agent is allowed to touch is
                     // not something the user should have to open a settings screen to find out.
                     .child(

@@ -35,6 +35,34 @@ impl Permission {
     pub const RESEARCH: Self = Self::READ.union(Self::WEB);
     pub const CODING: Self = Self::READ.union(Self::WRITE).union(Self::EXEC);
     pub const DOCUMENTATION: Self = Self::READ.union(Self::WRITE);
+
+    /// What a sub-agent gets when an agent holding `self` delegates a `role`.
+    ///
+    /// The intersection, never the preset on its own. Otherwise `delegate` is a privilege
+    /// escalation: a research agent with no write permission could ask for a coding sub-agent and
+    /// have it write the files it was refused.
+    pub fn delegated(self, role: Self) -> Self {
+        self & role
+    }
+}
+
+/// Runs a sub-agent on behalf of the `delegate` tool.
+///
+/// A trait, because a run needs the provider, the registry, the store and the event channel —
+/// none of which belong in a tool's signature, and all of which the engine already owns.
+pub trait Delegator: Send + Sync {
+    /// Run `task` as a sub-agent in `role`, at `depth`.
+    ///
+    /// `role` is the name the user sees on the sub-agent's approval prompts; `permission` is what
+    /// it asks for. The implementation is responsible for capping that at its own — see
+    /// [`Permission::delegated`].
+    fn run<'a>(
+        &'a self,
+        task: String,
+        role: &'static str,
+        permission: Permission,
+        depth: u8,
+    ) -> futures::future::BoxFuture<'a, Result<String, String>>;
 }
 
 /// Everything a tool is allowed to touch, assembled per run.
@@ -43,6 +71,9 @@ pub struct ToolCtx {
     pub cwd: PathBuf,
     /// Guards `delegate` recursion. Hard cap enforced by the registry.
     pub depth: u8,
+    /// `None` outside an agent run — the editor and the search panel share these tools' path
+    /// checks but have nothing to delegate to.
+    pub delegate: Option<Arc<dyn Delegator>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,13 +249,24 @@ impl<T: Tool> DynTool for T {
     }
 }
 
-/// How a pending call was resolved by the user.
+/// How a call that needed consent got it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Approval {
     Allow,
     /// Allow this exact tool for the rest of the session without asking again.
     AllowAlways,
     Deny,
+    /// Allowed without asking, because auto-approve mode is on. Never sent by the UI — the
+    /// engine produces it, and it exists so the audit log can tell "the user said yes" apart
+    /// from "nobody was asked".
+    Auto,
+}
+
+impl Approval {
+    /// Whether the call ran without anyone being prompted for it. The audit log's real question.
+    pub fn unattended(self) -> bool {
+        matches!(self, Self::Auto | Self::AllowAlways)
+    }
 }
 
 pub const MAX_DELEGATION_DEPTH: u8 = 5;
@@ -244,6 +286,7 @@ impl ToolRegistry {
         registry.register(builtins::ListDir);
         registry.register(builtins::SearchFiles);
         registry.register(builtins::RunCommand);
+        registry.register(builtins::Delegate);
         registry
     }
 
@@ -298,7 +341,7 @@ impl ToolRegistry {
 
         if tool.needs_approval(&args) {
             match approved {
-                Some(Approval::Allow | Approval::AllowAlways) => {}
+                Some(Approval::Allow | Approval::AllowAlways | Approval::Auto) => {}
                 Some(Approval::Deny) => {
                     tracing::info!(tool = name, "tool denied by the user");
                     return Err(ToolError::UserDenied);
@@ -348,7 +391,40 @@ mod tests {
             policy: PathPolicy::new(crate::fsaccess::AccessMode::FullSystem, [tmp.clone()], true),
             cwd: tmp,
             depth: 0,
+            delegate: None,
         }
+    }
+
+    #[test]
+    fn delegation_can_only_narrow_permissions() {
+        // The escalation this exists to stop: a read-only researcher asking for a coding
+        // sub-agent must not get a sub-agent that can write.
+        let sub = Permission::RESEARCH.delegated(Permission::CODING);
+        assert_eq!(sub, Permission::READ);
+        assert!(!sub.contains(Permission::WRITE));
+        assert!(!sub.contains(Permission::EXEC));
+
+        // And the other direction: a coding agent delegating research gets no web access it
+        // never had.
+        assert_eq!(Permission::CODING.delegated(Permission::RESEARCH), Permission::READ);
+
+        // Delegation itself is inherited only from a parent that had it. Without this a
+        // sub-agent could never delegate — no role preset carries `AGENT` — and with it, a
+        // parent that cannot delegate still cannot hand that power to a child.
+        let coordinator = Permission::CODING | Permission::AGENT;
+        let sub = coordinator.delegated(Permission::RESEARCH | Permission::AGENT);
+        assert!(sub.contains(Permission::AGENT));
+        assert!(!sub.contains(Permission::WEB), "still narrowed to what the parent had");
+        assert!(
+            !Permission::CODING
+                .delegated(Permission::CODING | Permission::AGENT)
+                .contains(Permission::AGENT),
+        );
+        // A role the parent fully covers passes through intact.
+        assert_eq!(
+            Permission::CODING.delegated(Permission::DOCUMENTATION),
+            Permission::DOCUMENTATION,
+        );
     }
 
     #[tokio::test]

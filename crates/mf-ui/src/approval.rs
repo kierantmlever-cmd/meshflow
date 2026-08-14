@@ -21,6 +21,8 @@ use crate::{Bridge, theme::Theme};
 pub struct PendingApproval {
     pub call: ToolCallId,
     pub tool: String,
+    /// The sub-agent that asked, if it was not the agent the user is talking to.
+    pub agent: Option<String>,
     pub preview: ToolPreview,
 }
 
@@ -86,14 +88,24 @@ impl Component for ApprovalModal {
                         .spacing(theme.gap(10.))
                         .child(
                             label()
-                                .text(match self.pending.preview.kind {
-                                    // "wants to run" reads like a command; what follows is a
-                                    // change to a file the user already has.
-                                    PreviewKind::Diff => {
-                                        format!("{} wants to apply this change:", self.pending.tool)
-                                    }
-                                    PreviewKind::Text => {
-                                        format!("{} wants to run:", self.pending.tool)
+                                .text({
+                                    // Named up front, because "who is asking" changes the answer:
+                                    // a sub-agent the user never addressed wanting to run a
+                                    // command is not the same request as the agent they did.
+                                    let who = match &self.pending.agent {
+                                        Some(role) => format!("The {role} sub-agent's "),
+                                        None => String::new(),
+                                    };
+                                    match self.pending.preview.kind {
+                                        // "wants to run" reads like a command; what follows is a
+                                        // change to a file the user already has.
+                                        PreviewKind::Diff => format!(
+                                            "{who}{} wants to apply this change:",
+                                            self.pending.tool,
+                                        ),
+                                        PreviewKind::Text => {
+                                            format!("{who}{} wants to run:", self.pending.tool)
+                                        }
                                     }
                                 })
                                 .color(theme.text_dim)

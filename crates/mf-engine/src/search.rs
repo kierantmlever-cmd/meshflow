@@ -1,14 +1,24 @@
-//! Literal text search and replace across the workspace.
+//! Text search and replace across the workspace, literal or by pattern.
 //!
-//! Deliberately plain substring matching, not regex. A coding agent and a person hunting for an
-//! identifier both want the literal thing they typed, and a regex engine here would mean a
-//! *replace* that can rewrite files in ways the preview never showed. Regex is a Phase 3 concern,
-//! alongside the tantivy index that will make this obsolete for large trees.
+//! Both modes run through one regex engine — a literal query is the escaped form of itself. That
+//! is fewer moving parts than a hand-rolled substring scan *and* more correct: matches come back
+//! as byte ranges into the original text, so case-insensitive matching can fold Unicode without
+//! the offsets sliding. (The previous literal scanner folded ASCII only, precisely because
+//! lowercasing `İ` changes a string's length and would have landed a replacement mid-character.)
+//!
+//! **The replacement is always literal**, in both modes. `$1` goes in as the three characters
+//! `$1`, never as a capture group.
+//!
+//! ponytail: no capture expansion — the confirm screen shows the *matched* lines and a count, and
+//! a rewrite that transforms them into something the user was never shown is exactly what that
+//! screen exists to prevent. Add `$1` when the confirmation can render before/after lines.
 //!
 //! Shared by the UI's search panel and the `search_files` tool, so the agent and the user get the
 //! same answers and the same boundary — see [`crate::files`] for why that matters.
 
 use std::path::{Path, PathBuf};
+
+use regex::{Regex, RegexBuilder};
 
 use crate::fsaccess::{Op, PathPolicy};
 
@@ -48,50 +58,48 @@ pub struct Results {
     pub truncated: bool,
 }
 
-/// Byte offsets of every non-overlapping occurrence of `needle`.
+/// What to look for, and how.
 ///
-/// Case-insensitive matching folds **ASCII only**, on purpose. Full Unicode folding can change a
-/// string's byte length — `İ` lowercases to two chars — which slides every offset after it and
-/// makes a replacement land in the wrong place. Getting that wrong corrupts files silently, and
-/// ASCII folding is what code identifiers actually need.
-fn find_all(haystack: &str, needle: &str, case_sensitive: bool) -> Vec<usize> {
-    // An empty needle matches at every position; replacing it would loop forever.
-    if needle.is_empty() {
-        return Vec::new();
-    }
-
-    let (hay, need) = if case_sensitive {
-        (haystack.to_owned(), needle.to_owned())
-    } else {
-        (haystack.to_ascii_lowercase(), needle.to_ascii_lowercase())
-    };
-
-    let mut offsets = Vec::new();
-    let mut from = 0;
-    while let Some(i) = hay[from..].find(&need) {
-        let at = from + i;
-        offsets.push(at);
-        from = at + need.len();
-    }
-    offsets
+/// One struct rather than a trail of positional booleans: `search(policy, root, q, true, false)`
+/// is a call whose two flags can be swapped without the compiler noticing, and one of them
+/// decides whether the text is a pattern or not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Query {
+    pub text: String,
+    pub case_sensitive: bool,
+    /// Treat [`Self::text`] as a regular expression rather than literal text.
+    pub regex: bool,
 }
 
-/// Replace every occurrence, returning the new text and how many were replaced.
-fn replace_in(text: &str, needle: &str, replacement: &str, case_sensitive: bool) -> (String, usize) {
-    let offsets = find_all(text, needle, case_sensitive);
-    if offsets.is_empty() {
-        return (text.to_owned(), 0);
+impl Query {
+    pub fn literal(text: impl Into<String>, case_sensitive: bool) -> Self {
+        Self { text: text.into(), case_sensitive, regex: false }
     }
 
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for at in &offsets {
-        out.push_str(&text[last..*at]);
-        out.push_str(replacement);
-        last = at + needle.len();
+    /// Compile the query, reporting a bad pattern in the terms the user typed it in.
+    ///
+    /// A malformed pattern is *user input*, not a bug: it arrives on every third keystroke of a
+    /// half-typed `(foo`, so it returns an error to display rather than anything louder.
+    fn compile(&self) -> Result<Regex, String> {
+        let pattern =
+            if self.regex { self.text.clone() } else { regex::escape(&self.text) };
+        RegexBuilder::new(&pattern)
+            .case_insensitive(!self.case_sensitive)
+            .build()
+            .map_err(|e| format!("Invalid pattern: {e}"))
     }
-    out.push_str(&text[last..]);
-    (out, offsets.len())
+}
+
+/// Replace every match, returning the new text and how many were replaced.
+///
+/// The replacement goes in verbatim — see the module docs for why capture expansion is not
+/// offered here.
+fn replace_in(re: &Regex, text: &str, replacement: &str) -> (String, usize) {
+    let count = re.find_iter(text).count();
+    if count == 0 {
+        return (text.to_owned(), 0);
+    }
+    (re.replace_all(text, regex::NoExpand(replacement)).into_owned(), count)
 }
 
 /// Every file under `root` the policy allows, depth first, skipping noise and oversized files.
@@ -133,15 +141,31 @@ fn walk(policy: &PathPolicy, root: &Path) -> Vec<PathBuf> {
     files
 }
 
-pub async fn search(
-    policy: &PathPolicy,
-    root: &Path,
-    query: String,
-    case_sensitive: bool,
-) -> Result<Results, String> {
-    if query.is_empty() {
+/// Every searchable file under `root`, relative to it and sorted.
+///
+/// The same walk the search uses, so the composer's `@` completion can never offer a file the
+/// policy denies — the list is filtered by the boundary rather than against it.
+pub async fn paths(policy: &PathPolicy, root: &Path) -> Result<Vec<PathBuf>, String> {
+    let root = policy.check(root, Op::Read).map_err(|e| e.to_string())?;
+    let policy = policy.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let mut files: Vec<PathBuf> = walk(&policy, &root)
+            .into_iter()
+            .map(|path| path.strip_prefix(&root).unwrap_or(&path).to_path_buf())
+            .collect();
+        files.sort();
+        Ok(files)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub async fn search(policy: &PathPolicy, root: &Path, query: Query) -> Result<Results, String> {
+    if query.text.is_empty() {
         return Ok(Results::default());
     }
+    let re = query.compile()?;
     let root = policy.check(root, Op::Read).map_err(|e| e.to_string())?;
     let policy = policy.clone();
 
@@ -153,12 +177,12 @@ pub async fn search(
             // A binary file fails here rather than being scanned as mojibake, which is the
             // behaviour we want and costs nothing to get.
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            if find_all(&text, &query, case_sensitive).is_empty() {
-                continue;
-            }
 
+            // Matched line by line, with no whole-file pre-check first. A pre-check would be
+            // faster but wrong for anchors: `^fn ` matches at the start of *the text*, so a file
+            // whose match is on line 40 would be skipped before the loop ever saw it.
             for (i, line) in text.lines().enumerate() {
-                if find_all(line, &query, case_sensitive).is_empty() {
+                if !re.is_match(line) {
                     continue;
                 }
                 if results.hits.len() >= MAX_HITS {
@@ -187,14 +211,25 @@ pub async fn search(
 pub async fn replace(
     policy: &PathPolicy,
     root: &Path,
-    query: String,
+    query: Query,
     replacement: String,
-    case_sensitive: bool,
 ) -> Result<(usize, usize), String> {
     // Guarded here and not only in the UI: this is the function that rewrites files, so the check
     // belongs where the damage would be done.
-    if query.is_empty() {
+    if query.text.is_empty() {
         return Err("Nothing to replace — the search box is empty.".into());
+    }
+    let re = query.compile()?;
+    // `a*`, `^`, `\b` and friends match at every position without consuming anything, so a
+    // replace would splice the replacement between every character of every file in the
+    // workspace. Refused rather than run: the search panel shows these as one hit per line,
+    // which is nothing like what the rewrite would do.
+    if re.is_match("") {
+        return Err(format!(
+            "`{}` matches the empty string, so replacing it would insert `{replacement}` between \
+             every character. Narrow the pattern.",
+            query.text
+        ));
     }
     let root = policy.check(root, Op::Read).map_err(|e| e.to_string())?;
     let policy = policy.clone();
@@ -209,7 +244,7 @@ pub async fn replace(
             let Ok(target) = policy.check(&path, Op::Write) else { continue };
             let Ok(text) = std::fs::read_to_string(&target) else { continue };
 
-            let (new_text, count) = replace_in(&text, &query, &replacement, case_sensitive);
+            let (new_text, count) = replace_in(&re, &text, &replacement);
             if count == 0 {
                 continue;
             }
@@ -251,43 +286,66 @@ mod tests {
         (tmp, root, policy)
     }
 
-    #[test]
-    fn finds_non_overlapping_occurrences() {
-        assert_eq!(find_all("aaaa", "aa", true), vec![0, 2]);
-        assert_eq!(find_all("abcabc", "abc", true), vec![0, 3]);
-        // An empty needle would otherwise match everywhere and make `replace_in` loop.
-        assert_eq!(find_all("abc", "", true), Vec::<usize>::new());
-    }
-
-    #[test]
-    fn case_insensitive_offsets_survive_non_ascii() {
-        // The reason folding is ASCII-only: if lowercasing changed byte lengths, every offset
-        // after a non-ASCII character would slide and the replacement would land mid-character.
-        let text = "café ALPHA café ALPHA";
-        let offsets = find_all(text, "alpha", false);
-        assert_eq!(offsets.len(), 2);
-        for at in offsets {
-            assert_eq!(&text[at..at + 5], "ALPHA", "offset {at} did not land on the match");
-        }
+    fn replace_literal(text: &str, needle: &str, to: &str, case_sensitive: bool) -> (String, usize) {
+        replace_in(&Query::literal(needle, case_sensitive).compile().unwrap(), text, to)
     }
 
     #[test]
     fn replaces_every_occurrence_and_counts_them() {
-        let (out, n) = replace_in("a b a b a", "a", "X", true);
+        let (out, n) = replace_literal("a b a b a", "a", "X", true);
         assert_eq!((out.as_str(), n), ("X b X b X", 3));
 
-        let (out, n) = replace_in("Foo foo FOO", "foo", "bar", false);
+        let (out, n) = replace_literal("Foo foo FOO", "foo", "bar", false);
         assert_eq!((out.as_str(), n), ("bar bar bar", 3));
 
         // Case-sensitive must not touch the others.
-        let (out, n) = replace_in("Foo foo FOO", "foo", "bar", true);
+        let (out, n) = replace_literal("Foo foo FOO", "foo", "bar", true);
         assert_eq!((out.as_str(), n), ("Foo bar FOO", 1));
+    }
+
+    #[test]
+    fn a_literal_query_is_never_read_as_a_pattern() {
+        // Typing `a.c` into the box means `a.c`, not "a, anything, c".
+        let (out, n) = replace_literal("a.c abc", "a.c", "X", true);
+        assert_eq!((out.as_str(), n), ("X abc", 1));
+    }
+
+    #[test]
+    fn the_replacement_is_literal_in_both_modes() {
+        // `$1` is three characters, not a capture group — the confirm screen showed the user
+        // matched lines and a count, and expansion would rewrite them into something else.
+        let re = Query { text: "(a)(b)".into(), case_sensitive: true, regex: true }
+            .compile()
+            .unwrap();
+        let (out, n) = replace_in(&re, "ab ab", "$1-$2");
+        assert_eq!((out.as_str(), n), ("$1-$2 $1-$2", 2));
+    }
+
+    #[test]
+    fn case_insensitive_matches_survive_non_ascii() {
+        // Ranges come from the original text, so folding can never slide an offset into the
+        // middle of a multi-byte character.
+        let re = Query::literal("alpha", false).compile().unwrap();
+        let text = "café ALPHA café ALPHA";
+        let spans: Vec<_> = re.find_iter(text).map(|m| m.range()).collect();
+        assert_eq!(spans.len(), 2);
+        for span in spans {
+            assert_eq!(&text[span], "ALPHA");
+        }
+    }
+
+    #[test]
+    fn a_malformed_pattern_is_an_error_not_a_panic() {
+        let bad = Query { text: "(unclosed".into(), case_sensitive: true, regex: true };
+        assert!(bad.compile().unwrap_err().starts_with("Invalid pattern"));
+        // The same characters are perfectly good literal text.
+        assert!(Query::literal("(unclosed", true).compile().is_ok());
     }
 
     #[tokio::test]
     async fn searches_the_workspace_and_respects_the_boundary() {
         let (_tmp, root, policy) = fixture();
-        let found = search(&policy, &root, "alpha".into(), false).await.unwrap();
+        let found = search(&policy, &root, Query::literal("alpha", false)).await.unwrap();
 
         let paths: Vec<String> = found
             .hits
@@ -307,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn case_sensitive_search_excludes_the_other_casing() {
         let (_tmp, root, policy) = fixture();
-        let found = search(&policy, &root, "alpha".into(), true).await.unwrap();
+        let found = search(&policy, &root, Query::literal("alpha", true)).await.unwrap();
         assert!(
             found.hits.iter().all(|h| !h.path.ends_with("b.rs")),
             "matched ALPHA in a case-sensitive search"
@@ -318,7 +376,7 @@ mod tests {
     async fn replace_rewrites_only_allowed_files() {
         let (_tmp, root, policy) = fixture();
         let (files, count) =
-            replace(&policy, &root, "alpha".into(), "gamma".into(), true).await.unwrap();
+            replace(&policy, &root, Query::literal("alpha", true), "gamma".into()).await.unwrap();
 
         assert_eq!((files, count), (1, 2), "expected both hits in a.rs and nothing else");
         assert_eq!(
@@ -335,7 +393,35 @@ mod tests {
         let (_tmp, root, policy) = fixture();
         // An empty needle matching everywhere would otherwise splice the replacement between
         // every character of every file in the workspace.
-        assert!(replace(&policy, &root, String::new(), "X".into(), true).await.is_err());
+        assert!(replace(&policy, &root, Query::default(), "X".into()).await.is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "let alpha = 1;\nlet beta = alpha + 1;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pattern_matches_by_line_wherever_the_line_sits_in_the_file() {
+        let (_tmp, root, policy) = fixture();
+        // `beta` is on line 2. An anchored pattern checked against the whole file first would
+        // never reach it.
+        let query = Query { text: r"^let \w+".into(), case_sensitive: true, regex: true };
+        let found = search(&policy, &root, query).await.unwrap();
+
+        let lines: Vec<u32> =
+            found.hits.iter().filter(|h| h.path.ends_with("a.rs")).map(|h| h.line).collect();
+        assert_eq!(lines, vec![1, 2], "anchored pattern missed a later line: {found:?}");
+    }
+
+    #[tokio::test]
+    async fn a_pattern_matching_the_empty_string_is_refused_rather_than_run() {
+        let (_tmp, root, policy) = fixture();
+        let query = Query { text: "x*".into(), case_sensitive: true, regex: true };
+
+        let err = replace(&policy, &root, query, "X".into()).await.unwrap_err();
+        assert!(err.contains("empty string"), "{err}");
+        // The workspace is untouched — this is the check that stands between `x*` and every file
+        // in the tree being shredded.
         assert_eq!(
             fs::read_to_string(root.join("src/a.rs")).unwrap(),
             "let alpha = 1;\nlet beta = alpha + 1;\n"
@@ -345,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn replace_leaves_no_temp_files() {
         let (_tmp, root, policy) = fixture();
-        replace(&policy, &root, "alpha".into(), "gamma".into(), true).await.unwrap();
+        replace(&policy, &root, Query::literal("alpha", true), "gamma".into()).await.unwrap();
 
         let leftovers: Vec<String> = fs::read_dir(root.join("src"))
             .unwrap()

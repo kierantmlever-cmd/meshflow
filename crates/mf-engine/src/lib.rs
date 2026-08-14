@@ -6,10 +6,12 @@
 
 pub mod agent;
 pub mod config;
+pub mod context;
 pub mod diff;
 pub mod files;
 pub mod fsaccess;
 pub mod logging;
+pub mod paths;
 pub mod proto;
 pub mod provider;
 pub mod search;
@@ -42,21 +44,227 @@ use proto::{
 };
 use provider::{AiProvider, AnyProvider, ProviderConfig, ProviderKind};
 use store::Store;
-use tool::{Permission, ToolCtx, ToolRegistry};
+use tool::{Delegator, Permission, ToolCtx, ToolRegistry};
 
 /// What the UI is told when a message is sent with nothing configured. Points at the fix rather
 /// than just naming the problem — this is the first thing a new user sees.
 const NO_PROVIDER: &str =
     "No AI provider configured. Open Settings and add one, or set MESHFLOW_API_KEY.";
 
-/// A resolved provider and the model to talk to.
-type Active = (Arc<AnyProvider>, String);
+/// A resolved provider, the model to talk to, and the history budget that model allows.
+type Active = (Arc<AnyProvider>, String, usize);
+
+/// Assumed window when nothing reported one. Small enough for a local 8B model to survive and
+/// for anything larger to merely under-use its window — the failure this avoids is one-sided,
+/// since guessing high means a rejected turn while guessing low only forgets sooner.
+const DEFAULT_CONTEXT_WINDOW: u32 = 32_000;
+
+/// The share of a model's window that history may occupy.
+///
+/// The rest covers the system prompt, the tool schemas and the reply, all of which count against
+/// the same window.
+///
+/// ponytail: a flat 75/25 split, not arithmetic on the real reserve — the reply ceiling is a
+/// provider-side default (`max_tokens`) rather than something this layer knows. Subtract the
+/// actual number if a small-window model ever has its reply truncated.
+pub fn budget_for(context_window: Option<u32>) -> usize {
+    context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW) as usize / 4 * 3
+}
 
 /// Layer 1 of the instruction hierarchy. The live path policy is appended at run time so the
 /// model learns its limits from the prompt rather than from a failed tool call.
 const SYSTEM_PROMPT: &str = "You are MeshFlow, a local AI coding assistant. Be concise. \
      Use markdown, and fenced code blocks with a language tag for code. \
      Use the provided tools to inspect and modify files rather than guessing at their contents.";
+
+/// Appended to a sub-agent's system prompt.
+///
+/// It has no conversation to fall back on and no way to ask, so it is told both — a sub-agent
+/// that ends its turn with "which file did you mean?" has burned the delegation.
+const SUB_AGENT_PROMPT: &str = "You are a sub-agent working on one delegated task. You cannot ask \
+     questions: the task text is the whole of your context. Only your final message is returned \
+     to the agent that delegated to you, so make it a complete answer rather than a summary of \
+     what you did.";
+
+/// What the top-level agent may do. `AGENT` is what puts `delegate` in its toolbox.
+const TOP_LEVEL: Permission = Permission::CODING.union(Permission::AGENT);
+
+/// Hard ceiling on the per-task agent count, whatever the UI asks for.
+///
+/// Every sub-agent is a full model run that can spawn more, so this is a spend limit as much as a
+/// concurrency one. Clamped here rather than trusted from the command: the engine is what bills.
+pub const MAX_AGENTS: u8 = 8;
+
+/// The sub-agents one task may still use, shared by every agent in its tree.
+///
+/// One pool for the whole task, not a fresh allowance per level — otherwise "at most 3" means 3
+/// at the top, 9 below it, 27 below that, which is not what anyone setting the number meant.
+#[derive(Clone)]
+struct AgentPool(Arc<std::sync::atomic::AtomicU8>);
+
+impl AgentPool {
+    fn new(size: u8) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(size.min(MAX_AGENTS))))
+    }
+
+    /// How many are still available. Used to decide whether a sub-agent is even offered
+    /// `delegate` — a tool that can only fail wastes a turn and reads as a broken environment.
+    fn remaining(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Claim one, if any are left. Atomic, because sibling agents can delegate at the same time
+    /// and a check-then-decrement would let both through on the last one.
+    fn take(&self) -> bool {
+        self.0
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .is_ok()
+    }
+}
+
+/// Tells the agent its allowance in the words the refusal will use, so it plans within the number
+/// instead of discovering it by being turned down.
+fn agent_budget_prompt(max_agents: u8) -> String {
+    match max_agents {
+        0 => "You have no sub-agents for this task. Do the work yourself.".to_owned(),
+        1 => "You may hand at most 1 task to a sub-agent. Delegate only if the work genuinely \
+              splits; otherwise do it yourself."
+            .to_owned(),
+        n => format!(
+            "You may use at most {n} sub-agents for this task, counting any they spawn in turn. \
+             That is a ceiling, not a target: use only as many as the work actually needs, and do \
+             the rest yourself."
+        ),
+    }
+}
+
+/// Runs sub-agents for the `delegate` tool.
+///
+/// Holds everything a run needs, so that delegating is the same code path as a top-level turn
+/// rather than a second, quieter implementation of it that drifts.
+#[derive(Clone)]
+struct SubAgents {
+    provider: Arc<AnyProvider>,
+    model: String,
+    system: String,
+    registry: Arc<ToolRegistry>,
+    policy: fsaccess::PathPolicy,
+    cwd: PathBuf,
+    store: Option<Store>,
+    events: broadcast::Sender<EngineEvent>,
+    pending: PendingApprovals,
+    always_allowed: Arc<Mutex<Vec<String>>>,
+    /// Shared, not copied: switching the mode off has to reach sub-agents already running.
+    auto_approve: Arc<std::sync::atomic::AtomicBool>,
+    /// What the *parent* holds. The ceiling on what any sub-agent it spawns can be granted.
+    granted: Permission,
+    budget: usize,
+    /// Sub-agents left for this task. Shared with every child, so the whole tree draws on it.
+    pool: AgentPool,
+    /// What the user set, for the refusal message — the pool itself only knows what is left.
+    max_agents: u8,
+}
+
+impl Delegator for SubAgents {
+    fn run<'a>(
+        &'a self,
+        task: String,
+        role: &'static str,
+        permission: Permission,
+        depth: u8,
+    ) -> futures::future::BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            // Claimed before anything is set up, so two siblings racing for the last slot cannot
+            // both get one. Recoverable on purpose: the agent is expected to absorb the work.
+            if !self.pool.take() {
+                tracing::info!(role, "delegation refused: the task's agent budget is spent");
+                return Err(format!(
+                    "All {} sub-agents for this task have been used. Do the remaining work \
+                     yourself.",
+                    self.max_agents,
+                ));
+            }
+
+            // `AGENT` rides along with the role, so a sub-agent can split its own work up in
+            // turn — none of the role presets carry it, and without this the depth cap, the
+            // nested delegator below and `TooDeep` would all be unreachable code. What bounds
+            // the tree is the depth cap, not the permission bits; every other permission is
+            // still narrowed to the role.
+            //
+            // Withheld once the pool is empty, though: with a cap of 1 the sub-agent would
+            // otherwise be handed a `delegate` whose every call is refused, and it spends a turn
+            // finding that out.
+            let inheritable = match self.pool.remaining() {
+                0 => permission,
+                _ => permission | Permission::AGENT,
+            };
+            let granted = self.granted.delegated(inheritable);
+            tracing::info!(role, ?granted, depth, "delegating");
+
+            // Its own conversation, not the parent's. Interleaving a sub-agent's turns into the
+            // transcript would leave a message sequence no provider would accept on reload —
+            // and a user reading the thread would see two agents talking over each other.
+            let conv = ConvId::new();
+            if let Some(store) = &self.store {
+                let title = format!(
+                    "delegated: {}",
+                    task.lines().next().unwrap_or_default().chars().take(80).collect::<String>(),
+                );
+                if let Err(e) = store.create_conversation(conv, &title).await {
+                    tracing::error!(%e, "could not record the delegated conversation");
+                }
+            }
+
+            // The sub-agent can delegate in turn, but only ever downwards: its own delegator is
+            // capped at what it was itself granted.
+            let child = Arc::new(Self { granted, ..self.clone() });
+            let ctx = Arc::new(ToolCtx {
+                policy: self.policy.clone(),
+                cwd: self.cwd.clone(),
+                depth,
+                delegate: Some(child),
+            });
+
+            let run = AgentRun {
+                run: RunId::new(),
+                conv,
+                store: self.store.clone(),
+                provider: Arc::clone(&self.provider),
+                model: self.model.clone(),
+                // The allowance is recomputed from what is *left*, not inherited: a sub-agent
+                // told "you may use at most 3" out of a pool its siblings have already drained
+                // plans around agents it cannot have.
+                system: format!(
+                    "{}\n\n{}\n\n{SUB_AGENT_PROMPT}",
+                    self.system,
+                    agent_budget_prompt(self.pool.remaining()),
+                ),
+                registry: Arc::clone(&self.registry),
+                ctx,
+                granted,
+                budget: self.budget,
+                history: Arc::new(Mutex::new(vec![provider::Message::user(task)])),
+                pending: Arc::clone(&self.pending),
+                events: self.events.clone(),
+                always_allowed: Arc::clone(&self.always_allowed),
+                auto_approve: Arc::clone(&self.auto_approve),
+                quiet: true,
+                agent: Some(role.to_owned()),
+            };
+
+            match run.execute().await.trim() {
+                // Reported as a failure rather than returned as an empty string: the parent would
+                // read `""` as an answer and carry on as if the work were done.
+                "" => Err("the sub-agent finished without producing an answer".into()),
+                answer => Ok(answer.to_owned()),
+            }
+        })
+    }
+}
 
 /// Everything derived from the active workspace root.
 ///
@@ -97,7 +305,10 @@ impl Sandbox {
 
         let root = policy.roots().first().cloned().unwrap_or_else(|| ".".into());
         let system = format!("{SYSTEM_PROMPT}\n\n{}", policy.describe());
-        let ctx = Arc::new(ToolCtx { cwd: root.clone(), policy, depth: 0 });
+        // No delegator: this is the sandbox the editor and the search panel share. A run builds
+        // its own context on top of these, because delegation needs the provider and the model,
+        // which belong to the run rather than to the workspace.
+        let ctx = Arc::new(ToolCtx { cwd: root.clone(), policy, depth: 0, delegate: None });
         (Self { ctx, system, root }, warn)
     }
 }
@@ -146,7 +357,24 @@ pub async fn run(
 
     // One client for every provider: connection pooling is what keeps ten concurrent agents from
     // opening ten TLS handshakes to the same host.
-    let http = reqwest::Client::new();
+    //
+    // The timeouts are not optional. A streaming response that stops arriving — a dropped TLS
+    // connection, a proxy timing out an idle stream, a provider that simply stalls — leaves the
+    // run parked on the next chunk *forever*, and all the user sees is a caret that never turns
+    // into a reply. `read_timeout` is the one that matters: it bounds the gap between chunks
+    // rather than the length of the response, so a model that thinks for two minutes is fine
+    // while a stream that dies mid-flight fails and says so.
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(120))
+        // Detects the half-open connection that produces this symptom in the first place: the
+        // socket looks ESTABLISHED to us long after the other end is gone.
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::error!(%e, "could not build the http client with timeouts");
+            reqwest::Client::new()
+        });
 
     // Not fatal when absent. A first run has no providers yet, and the app has to come up so the
     // user can add one — refusing to start is how a settings screen becomes unreachable.
@@ -162,26 +390,44 @@ pub async fn run(
             None
         }
     };
-    if let Some((provider, model)) = &active {
-        tracing::info!(model, base_url = %provider.base_url(), "provider ready");
+    if let Some((provider, model, budget)) = &active {
+        tracing::info!(model, base_url = %provider.base_url(), budget, "provider ready");
     }
 
     let registry = Arc::new(ToolRegistry::with_builtins());
     let history: Arc<Mutex<Vec<provider::Message>>> = Arc::default();
     let pending: PendingApprovals = Arc::default();
     let always_allowed: Arc<Mutex<Vec<String>>> = Arc::default();
-    let mut runs: HashMap<RunId, JoinHandle<()>> = HashMap::new();
+    // Off at every start. Not persisted anywhere on purpose — see `SetAutoApprove`.
+    let auto_approve = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The answer a run returns is only of interest to a *delegating* agent; a top-level run has
+    // already streamed every word of it to the UI, so the handle is kept purely to abort it.
+    let mut runs: HashMap<RunId, JoinHandle<String>> = HashMap::new();
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            EngineCommand::SendUserMessage { text, .. } => {
-                let Some((provider, model)) = active.clone() else {
+            EngineCommand::SendUserMessage { text, max_agents, .. } => {
+                let max_agents = max_agents.min(MAX_AGENTS);
+                let Some((provider, model, budget)) = active.clone() else {
                     let _ = evt_tx
                         .send(EngineEvent::Error { run: None, message: NO_PROVIDER.into() });
                     continue;
                 };
 
-                let message = provider::Message::user(text);
+                // Attachments go in front of the question: the model reads the material, then
+                // what to do with it. Resolved once, here, so the transcript records what was
+                // actually sent rather than a path whose contents have since changed.
+                let message = match context::attach(&sandbox.ctx.policy, &sandbox.root, &text).await
+                {
+                    Some(attached) => provider::Message {
+                        role: provider::Role::User,
+                        content: vec![
+                            provider::Part::Text(attached),
+                            provider::Part::Text(text),
+                        ],
+                    },
+                    None => provider::Message::user(text),
+                };
                 if let Some(store) = &store
                     && let Err(e) = store.append_message(conv, &message).await
                 {
@@ -190,6 +436,43 @@ pub async fn run(
                 history.lock().unwrap().push(message);
 
                 let run = RunId::new();
+                // With no agents allowed, `delegate` is not merely refused — it is never
+                // advertised. Offering a tool that always fails wastes a turn and reads to the
+                // model as a broken environment.
+                let granted =
+                    if max_agents == 0 { Permission::CODING } else { TOP_LEVEL };
+                let system = format!("{}\n\n{}", sandbox.system, agent_budget_prompt(max_agents));
+
+                // Built per run, not per workspace: it carries the provider and the model in
+                // force right now, so a settings change between turns lands on the next
+                // delegation too.
+                let delegator = Arc::new(SubAgents {
+                    provider: Arc::clone(&provider),
+                    model: model.clone(),
+                    // The *base* prompt: every run below composes its own allowance onto it from
+                    // what the pool has left.
+                    system: sandbox.system.clone(),
+                    registry: Arc::clone(&registry),
+                    policy: sandbox.ctx.policy.clone(),
+                    cwd: sandbox.ctx.cwd.clone(),
+                    store: store.clone(),
+                    events: evt_tx.clone(),
+                    pending: Arc::clone(&pending),
+                    always_allowed: Arc::clone(&always_allowed),
+                    auto_approve: Arc::clone(&auto_approve),
+                    granted,
+                    budget,
+                    // One pool per task, created here and shared down the tree.
+                    pool: AgentPool::new(max_agents),
+                    max_agents,
+                });
+                let ctx = Arc::new(ToolCtx {
+                    policy: sandbox.ctx.policy.clone(),
+                    cwd: sandbox.ctx.cwd.clone(),
+                    depth: 0,
+                    delegate: Some(delegator),
+                });
+
                 let agent = AgentRun {
                     run,
                     conv,
@@ -198,14 +481,20 @@ pub async fn run(
                     model,
                     // Snapshotted per run. A workspace switch mid-run leaves this one on the
                     // boundary it was told about and started working inside.
-                    system: sandbox.system.clone(),
+                    system,
                     registry: Arc::clone(&registry),
-                    ctx: Arc::clone(&sandbox.ctx),
-                    granted: Permission::CODING,
+                    ctx,
+                    granted,
+                    budget,
                     history: Arc::clone(&history),
                     pending: Arc::clone(&pending),
                     events: evt_tx.clone(),
                     always_allowed: Arc::clone(&always_allowed),
+                    auto_approve: Arc::clone(&auto_approve),
+                    quiet: false,
+                    // The agent the user is addressing needs no label; every prompt they have
+                    // ever seen came from it.
+                    agent: None,
                 };
                 runs.insert(run, tokio::spawn(agent.execute()));
             }
@@ -219,6 +508,34 @@ pub async fn run(
                 } else {
                     tracing::warn!(%call, "approval for an unknown or already-resolved call");
                 }
+            }
+
+            EngineCommand::SetAutoApprove(on) => {
+                auto_approve.store(on, std::sync::atomic::Ordering::SeqCst);
+                // Recorded at warn level in both directions: the log has to show when the
+                // prompts stopped and when they came back, or an unattended write cannot be
+                // placed in time afterwards.
+                tracing::warn!(on, "auto-approve mode changed");
+                if let Some(store) = &store
+                    && let Err(e) = store
+                        .audit(store::AuditEntry {
+                            action: "approval",
+                            tool: None,
+                            detail: Some(if on {
+                                "auto-approve turned ON — tool calls run without asking"
+                            } else {
+                                "auto-approve turned off — tool calls prompt again"
+                            }),
+                            approved: None,
+                            unattended: on,
+                            elevated: false,
+                            ok: Some(true),
+                        })
+                        .await
+                {
+                    tracing::error!(%e, "could not audit the auto-approve change");
+                }
+                let _ = evt_tx.send(EngineEvent::AutoApprove(on));
             }
 
             EngineCommand::RequestProviders => send_providers(&evt_tx).await,
@@ -426,19 +743,21 @@ pub async fn run(
                 });
             }
 
-            EngineCommand::Search { query, case_sensitive } => {
+            EngineCommand::Search { query } => {
                 let (policy, root, evt_tx) =
                     (sandbox.ctx.policy.clone(), sandbox.root.clone(), evt_tx.clone());
                 tokio::spawn(async move {
-                    match search::search(&policy, &root, query.clone(), case_sensitive).await {
+                    let text = query.text.clone();
+                    match search::search(&policy, &root, query).await {
                         Ok(results) => {
                             tracing::info!(
-                                %query,
+                                query = %text,
                                 hits = results.hits.len(),
                                 files = results.files_searched,
                                 "search finished",
                             );
-                            let _ = evt_tx.send(EngineEvent::SearchResults { query, results });
+                            let _ =
+                                evt_tx.send(EngineEvent::SearchResults { query: text, results });
                         }
                         Err(message) => {
                             let _ = evt_tx.send(EngineEvent::Error { run: None, message });
@@ -447,22 +766,43 @@ pub async fn run(
                 });
             }
 
-            EngineCommand::Replace { query, replacement, case_sensitive } => {
+            EngineCommand::RequestWorkspaceFiles => {
                 let (policy, root, evt_tx) =
                     (sandbox.ctx.policy.clone(), sandbox.root.clone(), evt_tx.clone());
                 tokio::spawn(async move {
-                    match search::replace(&policy, &root, query.clone(), replacement, case_sensitive)
-                        .await
-                    {
+                    match search::paths(&policy, &root).await {
+                        Ok(files) => {
+                            let _ = evt_tx.send(EngineEvent::WorkspaceFiles { files });
+                        }
+                        // Logged, not shown: this answers a keystroke the user did not ask a
+                        // question with, and a modal about it would be noise. The completion
+                        // list simply stays as it was.
+                        Err(e) => tracing::warn!(%e, "could not list workspace files"),
+                    }
+                });
+            }
+
+            EngineCommand::Replace { query, replacement } => {
+                let (policy, root, evt_tx) =
+                    (sandbox.ctx.policy.clone(), sandbox.root.clone(), evt_tx.clone());
+                tokio::spawn(async move {
+                    let (text, regex) = (query.text.clone(), query.regex);
+                    match search::replace(&policy, &root, query, replacement).await {
                         Ok((files, replacements)) => {
                             // Logged unconditionally: this rewrites files in bulk with no
                             // per-file approval, so the audit trail is the only record of what
                             // happened if the result is not what the user expected.
-                            tracing::info!(%query, files, replacements, "replace finished");
+                            tracing::info!(
+                                query = %text,
+                                regex,
+                                files,
+                                replacements,
+                                "replace finished",
+                            );
                             let _ = evt_tx.send(EngineEvent::Replaced { files, replacements });
                         }
                         Err(message) => {
-                            tracing::error!(%query, %message, "replace failed");
+                            tracing::error!(query = %text, %message, "replace failed");
                             let _ = evt_tx.send(EngineEvent::Error { run: None, message });
                         }
                     }
@@ -527,8 +867,8 @@ async fn reload(
 ) {
     match resolve_provider(http).await {
         Ok(found) => {
-            if let Some((provider, model)) = &found {
-                tracing::info!(model, base_url = %provider.base_url(), "provider reloaded");
+            if let Some((provider, model, budget)) = &found {
+                tracing::info!(model, base_url = %provider.base_url(), budget, "provider reloaded");
             }
             *active = found;
         }
@@ -762,7 +1102,7 @@ fn provider_from_config(entry: &ProviderEntry, http: &reqwest::Client) -> Result
         headers: entry.headers.clone(),
     };
     let provider = AnyProvider::new(cfg, http.clone()).map_err(|e| e.to_string())?;
-    Ok((Arc::new(provider), entry.model.clone()))
+    Ok((Arc::new(provider), entry.model.clone(), budget_for(entry.context_window)))
 }
 
 /// Development override. Pointing `MESHFLOW_BASE_URL` at Ollama or LM Studio works with no key.
@@ -791,13 +1131,79 @@ fn provider_from_env(http: &reqwest::Client) -> Result<Option<Active>, String> {
         headers: Default::default(),
     };
     let provider = AnyProvider::new(cfg, http.clone()).map_err(|e| e.to_string())?;
-    Ok(Some((Arc::new(provider), model)))
+    // The env override names a model but never a window — whatever it points at gets the
+    // conservative default, which is the right guess for the Ollama endpoint it usually is.
+    Ok(Some((Arc::new(provider), model, budget_for(None))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use fsaccess::Op;
+
+    #[test]
+    fn the_agent_pool_hands_out_exactly_what_it_was_given() {
+        let pool = AgentPool::new(2);
+        assert!(pool.take());
+        assert!(pool.take());
+        assert!(!pool.take(), "a third agent came out of a pool of two");
+    }
+
+    #[test]
+    fn the_pool_is_shared_by_the_whole_tree_not_refilled_per_level() {
+        // What "at most 2" has to mean: two agents for the task, not two per level — which
+        // would be 2, then 4, then 8 as they nest.
+        let pool = AgentPool::new(2);
+        let child = pool.clone();
+        assert!(pool.take());
+        assert!(child.take(), "the child draws on the same pool");
+        assert!(!child.take());
+        assert!(!pool.take(), "the parent sees the child's spending");
+    }
+
+    #[test]
+    fn the_last_agent_out_of_the_pool_is_not_given_the_power_to_delegate() {
+        // What the transcript showed: with a cap of 1, the sub-agent kept `delegate` and spent a
+        // turn being told the pool was empty.
+        let pool = AgentPool::new(1);
+        assert!(pool.take());
+        assert_eq!(pool.remaining(), 0);
+
+        let inheritable = match pool.remaining() {
+            0 => Permission::CODING,
+            _ => Permission::CODING | Permission::AGENT,
+        };
+        assert!(!TOP_LEVEL.delegated(inheritable).contains(Permission::AGENT));
+
+        // With room to spare it is still passed down.
+        let roomy = AgentPool::new(3);
+        assert!(roomy.take());
+        assert!(roomy.remaining() > 0);
+        assert!(
+            TOP_LEVEL
+                .delegated(Permission::CODING | Permission::AGENT)
+                .contains(Permission::AGENT),
+        );
+    }
+
+    #[test]
+    fn a_pool_of_zero_never_hands_one_out() {
+        assert!(!AgentPool::new(0).take());
+        // And the ceiling holds whatever the command asked for.
+        let huge = AgentPool::new(u8::MAX);
+        for _ in 0..MAX_AGENTS {
+            assert!(huge.take());
+        }
+        assert!(!huge.take(), "the engine's own ceiling is what counts");
+    }
+
+    #[test]
+    fn the_budget_prompt_states_the_number_the_refusal_will_use() {
+        assert!(agent_budget_prompt(0).contains("no sub-agents"));
+        assert!(agent_budget_prompt(3).contains('3'));
+        // A ceiling has to read as one, or the model treats it as work to be done.
+        assert!(agent_budget_prompt(3).contains("ceiling, not a target"));
+    }
 
     #[test]
     fn a_workspace_root_bounds_the_sandbox() {

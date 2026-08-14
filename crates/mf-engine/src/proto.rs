@@ -44,6 +44,14 @@ pub enum EngineCommand {
     SendUserMessage {
         conv: ConvId,
         text: String,
+        /// Ceiling on how many sub-agents this one task may use, across the whole delegation
+        /// tree. `0` turns delegation off, and the tool is not even offered.
+        ///
+        /// A ceiling, not a target — the agent is told the number and told to use only what the
+        /// work needs. It rides with the message because it belongs to the task, not to the app:
+        /// "summarise this file" and "port these six modules" want different answers, and the
+        /// user sets it while looking at the thing they are about to send.
+        max_agents: u8,
     },
     CancelRun(RunId),
     /// The user's answer to an [`EngineEvent::ApprovalNeeded`]. The run stays parked until
@@ -53,6 +61,13 @@ pub enum EngineCommand {
         decision: crate::tool::Approval,
     },
 
+    /// Run tool calls that would need approval without asking for it.
+    ///
+    /// Off at startup, every time — it is deliberately not persisted. A mode that lets an agent
+    /// overwrite files and run shell commands unattended should not be something a user turned on
+    /// once, weeks ago, and has since forgotten about. Answered with
+    /// [`EngineEvent::AutoApprove`], so what the UI shows is what the engine is actually doing.
+    SetAutoApprove(bool),
     /// Ask for the provider list. Answered with [`EngineEvent::Providers`].
     RequestProviders,
     /// Create or replace a provider entry by name, and make it the active one.
@@ -107,18 +122,20 @@ pub enum EngineCommand {
     },
     /// Search the workspace. Answered with [`EngineEvent::SearchResults`].
     Search {
-        query: String,
-        case_sensitive: bool,
+        query: crate::search::Query,
     },
+    /// Ask for every file in the workspace, to complete an `@` mention against. Answered with
+    /// [`EngineEvent::WorkspaceFiles`].
+    RequestWorkspaceFiles,
     /// Rewrite every match in the workspace.
     ///
     /// Destructive and not individually approved — the user confirms the count once, in the UI,
     /// having seen the matches this replaces. Kept a separate command from [`Self::Search`] so a
     /// keystroke in the search box can never be one character away from rewriting the tree.
     Replace {
-        query: String,
+        query: crate::search::Query,
+        /// Inserted verbatim. `$1` is three characters here, not a capture group.
         replacement: String,
-        case_sensitive: bool,
     },
     /// Write an editor buffer back to disk.
     ///
@@ -151,12 +168,19 @@ pub enum EngineEvent {
         run: RunId,
         call: ToolCallId,
         tool: String,
+        /// Which agent is asking. `None` is the one the user is talking to; `Some(role)` is a
+        /// sub-agent it delegated to. Shown on the modal, because consenting to `rm -rf` from a
+        /// sub-agent the user never addressed is a different decision than consenting to one they
+        /// asked for.
+        agent: Option<String>,
         preview: crate::tool::ToolPreview,
     },
     ToolStarted {
         run: RunId,
         call: ToolCallId,
         tool: String,
+        /// See [`Self::ApprovalNeeded::agent`].
+        agent: Option<String>,
     },
     ToolFinished {
         run: RunId,
@@ -174,6 +198,9 @@ pub enum EngineEvent {
         message: String,
     },
 
+    /// Auto-approve's state, as the *engine* has it. The UI shows this rather than what it last
+    /// sent, so the badge on screen can never claim the prompts are back when they are not.
+    AutoApprove(bool),
     /// The current provider list, sent on request and after every change.
     Providers {
         providers: Vec<ProviderSummary>,
@@ -212,6 +239,11 @@ pub enum EngineEvent {
     /// marking it clean when the write might still fail is how unsaved work gets lost.
     FileSaved {
         path: std::path::PathBuf,
+    },
+    /// Workspace-relative paths for `@` completion, filtered by the same policy as everything
+    /// else — a file that cannot be attached is never offered.
+    WorkspaceFiles {
+        files: Vec<std::path::PathBuf>,
     },
     /// Matches for the query the UI last sent.
     SearchResults {
@@ -309,6 +341,7 @@ mod tests {
                 kind: ProviderKind::OpenAi,
                 base_url: "https://api.openai.com/v1".into(),
                 model: "gpt-4o-mini".into(),
+                context_window: None,
                 needs_key: true,
                 org_id: None,
                 headers: Default::default(),

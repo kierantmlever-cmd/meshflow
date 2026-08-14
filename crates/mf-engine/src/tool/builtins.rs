@@ -17,7 +17,9 @@ use crate::fsaccess::Op;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-fn truncate(mut s: String, what: &str) -> String {
+/// Shared with [`crate::context`]: one cap on how much text any single blob may inject into a
+/// request, whether a tool produced it or the user attached it with `@`.
+pub(crate) fn truncate(mut s: String, what: &str) -> String {
     if s.len() > MAX_OUTPUT_BYTES {
         // Cut on a char boundary; `s` may be UTF-8 and slicing mid-codepoint panics.
         let mut end = MAX_OUTPUT_BYTES;
@@ -258,20 +260,25 @@ impl Tool for SearchFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Search the workspace for a literal string. Returns matching lines as 'path:line: text'. \
-         This is plain substring matching, not a regular expression."
+        "Search the workspace. Returns matching lines as 'path:line: text'. The query is literal \
+         text unless `regex` is true, in which case it is a Rust regular expression matched \
+         against each line on its own — so `^` and `$` anchor to the line."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Literal text to find." },
+                "query": { "type": "string", "description": "Text or pattern to find." },
                 "path": {
                     "type": "string",
                     "description": "Directory to search under. Defaults to the workspace root."
                 },
-                "case_sensitive": { "type": "boolean", "description": "Defaults to false." }
+                "case_sensitive": { "type": "boolean", "description": "Defaults to false." },
+                "regex": {
+                    "type": "boolean",
+                    "description": "Treat the query as a regular expression. Defaults to false."
+                }
             },
             "required": ["query"]
         })
@@ -284,23 +291,24 @@ impl Tool for SearchFiles {
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let query = super::arg_str(&args, "query", self.name())?;
         let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let case_sensitive =
-            args.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false);
+        let query = crate::search::Query {
+            text: query,
+            case_sensitive: args.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false),
+            regex: args.get("regex").and_then(Value::as_bool).unwrap_or(false),
+        };
 
-        let results = crate::search::search(
-            &ctx.policy,
-            std::path::Path::new(raw),
-            query.clone(),
-            case_sensitive,
-        )
-        .await
-        .map_err(ToolError::Failed)?;
+        // A pattern the model got wrong comes back as a tool error it can read and fix, which is
+        // the same treatment a denied path gets.
+        let results =
+            crate::search::search(&ctx.policy, std::path::Path::new(raw), query.clone())
+                .await
+                .map_err(ToolError::Failed)?;
 
         if results.hits.is_empty() {
             // Said plainly rather than returned as an empty string: a blank tool result reads to
             // a model as a failure, and it retries the same search instead of moving on.
             return Ok(ToolOutput::with_summary(
-                format!("No matches for `{query}` in {} files.", results.files_searched),
+                format!("No matches for `{}` in {} files.", query.text, results.files_searched),
                 format!("searched {} files, no matches", results.files_searched),
             ));
         }
@@ -315,7 +323,7 @@ impl Tool for SearchFiles {
 
         Ok(ToolOutput::with_summary(
             truncate(body, "results"),
-            format!("{} matches for `{query}`{note}", results.hits.len()),
+            format!("{} matches for `{}`{note}", results.hits.len(), query.text),
         ))
     }
 }
@@ -427,6 +435,89 @@ impl Tool for RunCommand {
     }
 }
 
+/// Hand a task to a sub-agent with a narrower role.
+pub struct Delegate;
+
+/// The roles a task can be delegated to, and the permissions each implies.
+///
+/// A closed set, not a permission list the model composes: letting a model assemble the bit
+/// pattern for its own sub-agent is asking it to grant itself `EXEC`, and it will.
+const ROLES: &[(&str, Permission)] = &[
+    ("research", Permission::RESEARCH),
+    ("coding", Permission::CODING),
+    ("documentation", Permission::DOCUMENTATION),
+];
+
+impl Tool for Delegate {
+    fn name(&self) -> &'static str {
+        "delegate"
+    }
+
+    fn description(&self) -> &'static str {
+        "Hand one self-contained task to a sub-agent and get its final answer back. The sub-agent \
+         sees only the task text — none of this conversation — so describe the job completely. \
+         Roles: research (read and web), coding (read, write, run commands), documentation \
+         (read and write). The sub-agent never gets a permission you do not already hold."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "enum": ROLES.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                    "description": "Which role the sub-agent takes."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The complete task, including any context the sub-agent needs."
+                }
+            },
+            "required": ["role", "task"]
+        })
+    }
+
+    fn permission(&self) -> Permission {
+        Permission::AGENT
+    }
+
+    /// No approval of its own. A sub-agent's destructive calls each stop at the same modal this
+    /// one would — approving the *delegation* would be consenting to work nobody has described
+    /// yet, which is worse than not asking.
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let role = arg_str(&args, "role", self.name())?;
+        let task = arg_str(&args, "task", self.name())?;
+
+        let Some((name, permission)) = ROLES.iter().find(|(name, _)| *name == role) else {
+            return Err(ToolError::BadArguments {
+                tool: self.name().to_owned(),
+                reason: format!(
+                    "unknown role `{role}` — use one of: {}",
+                    ROLES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "),
+                ),
+            });
+        };
+
+        let Some(delegate) = &ctx.delegate else {
+            return Err(ToolError::Failed(
+                "delegation is not available here — this tool only works inside an agent run"
+                    .into(),
+            ));
+        };
+
+        let answer = delegate
+            .run(task, name, *permission, ctx.depth + 1)
+            .await
+            .map_err(ToolError::Failed)?;
+
+        Ok(ToolOutput::with_summary(
+            truncate(answer, "answer"),
+            format!("delegated to a {role} agent"),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +533,7 @@ mod tests {
             policy: PathPolicy::new(AccessMode::WorkspaceSandbox, [root.clone()], true),
             cwd: root,
             depth: 0,
+            delegate: None,
         };
         (tmp, ctx)
     }
@@ -688,6 +780,72 @@ mod tests {
 
         assert_eq!(preview.summary.lines().count(), 1, "summary: {}", preview.summary);
         assert!(preview.summary.contains("+500 −500"), "{}", preview.summary);
+    }
+
+    /// Stands in for the engine, recording what the tool asked it to run.
+    #[derive(Default)]
+    struct Recorder {
+        calls: std::sync::Mutex<Vec<(String, &'static str, Permission, u8)>>,
+    }
+
+    impl super::super::Delegator for Recorder {
+        fn run<'a>(
+            &'a self,
+            task: String,
+            role: &'static str,
+            permission: Permission,
+            depth: u8,
+        ) -> futures::future::BoxFuture<'a, Result<String, String>> {
+            self.calls.lock().unwrap().push((task, role, permission, depth));
+            Box::pin(async { Ok("the sub-agent's answer".to_owned()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_maps_the_role_and_descends_one_level() {
+        let (_tmp, mut ctx) = sandbox();
+        let recorder = std::sync::Arc::new(Recorder::default());
+        ctx.depth = 2;
+        ctx.delegate = Some(recorder.clone());
+
+        let out = Delegate
+            .call(&ctx, json!({ "role": "research", "task": "find the release date" }))
+            .await
+            .unwrap();
+
+        assert_eq!(out.content, "the sub-agent's answer");
+        let calls = recorder.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "find the release date");
+        // The role travels as a name too — it is what the approval modal says out loud.
+        assert_eq!(calls[0].1, "research");
+        assert_eq!(calls[0].2, Permission::RESEARCH);
+        // One deeper than the caller, which is what the registry's cap counts.
+        assert_eq!(calls[0].3, 3, "delegation must descend, or the depth cap never bites");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_role_names_the_ones_that_exist() {
+        let (_tmp, mut ctx) = sandbox();
+        ctx.delegate = Some(std::sync::Arc::new(Recorder::default()));
+
+        let err = Delegate
+            .call(&ctx, json!({ "role": "sysadmin", "task": "do it" }))
+            .await
+            .unwrap_err();
+
+        // The model can fix this from the message alone, which is the point.
+        let message = err.to_string();
+        assert!(message.contains("research"), "{message}");
+        assert!(message.contains("coding"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn delegating_without_an_engine_behind_it_fails_loudly() {
+        // The editor and the search panel share these tools' context and have nothing to run a
+        // sub-agent with; silently returning nothing would read to a model as a done task.
+        let (_tmp, ctx) = sandbox();
+        let err = Delegate.call(&ctx, json!({ "role": "coding", "task": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("not available"), "{err}");
     }
 
     #[tokio::test]

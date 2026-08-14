@@ -7,7 +7,10 @@
 //! consenting to a number they have been shown, not to a verb.
 
 use freya::prelude::*;
-use mf_engine::{proto::EngineCommand, search::Results};
+use mf_engine::{
+    proto::EngineCommand,
+    search::{Query, Results},
+};
 
 use crate::{Bridge, state::AppState, theme::Theme};
 
@@ -18,6 +21,8 @@ pub struct SearchState {
     pub query: String,
     pub replacement: String,
     pub case_sensitive: bool,
+    /// Read the query as a pattern rather than as the text it is.
+    pub regex: bool,
     pub results: Results,
     /// True once Replace has been asked for and is waiting on the confirm click.
     pub confirming: bool,
@@ -54,19 +59,32 @@ impl Component for SearchBox {
                     return;
                 }
                 w.query = query.clone();
-                let case_sensitive = w.case_sensitive;
+                let query =
+                    Query { text: query, case_sensitive: w.case_sensitive, regex: w.regex };
                 drop(w);
-                let _ = cmd_tx.send(EngineCommand::Search { query, case_sensitive });
+                let _ = cmd_tx.send(EngineCommand::Search { query });
             }
         };
 
+        // Both switches re-run immediately: leaving stale results under a flipped switch would
+        // show matches that the current settings do not produce — and Replace acts on the
+        // settings, not on the rows.
         let toggle_case = {
             let mut run = run.clone();
             move |_| {
                 let next = !search.read().case_sensitive;
                 search.write().case_sensitive = next;
-                // Re-run immediately: leaving stale results under a flipped switch would show
-                // matches that the current settings do not produce.
+                if !search.read().query.is_empty() {
+                    run();
+                }
+            }
+        };
+
+        let toggle_regex = {
+            let mut run = run.clone();
+            move |_| {
+                let next = !search.read().regex;
+                search.write().regex = next;
                 if !search.read().query.is_empty() {
                     run();
                 }
@@ -109,12 +127,12 @@ impl Component for SearchBox {
             let cmd_tx = bridge.cmd_tx.clone();
             move |_| {
                 let w = search.read();
-                let (query, case_sensitive) = (w.query.clone(), w.case_sensitive);
+                let query =
+                    Query { text: w.query.clone(), case_sensitive: w.case_sensitive, regex: w.regex };
                 drop(w);
                 let _ = cmd_tx.send(EngineCommand::Replace {
                     query,
                     replacement: replacement.read().clone(),
-                    case_sensitive,
                 });
                 search.write().confirming = false;
             }
@@ -169,6 +187,13 @@ impl Component for SearchBox {
                             .color(theme.text_dim)
                             .font_size(theme.font_size - 3.)
                             .text("Match case"),
+                    )
+                    .child(Switch::new().toggled(snapshot.regex).on_toggle(toggle_regex))
+                    .child(
+                        label()
+                            .color(theme.text_dim)
+                            .font_size(theme.font_size - 3.)
+                            .text("Regex"),
                     ),
             )
             .map((!snapshot.query.is_empty()).then_some(()), |root, ()| {
@@ -197,15 +222,24 @@ impl Component for SearchBox {
                         .child(
                             Input::new(replacement)
                                 .width(Size::flex(1.))
-                                .placeholder("Replace with"),
+                                // Says "literal" because in regex mode the obvious expectation is
+                                // that `$1` means something. It does not — see `search::replace`.
+                                .placeholder("Replace with (literal)"),
                         )
+                        // "at least", because the hit list stops at 500 while the replace does
+                        // not. A broad pattern like `\w+` hits that cap immediately, and a
+                        // confirmation that understates what it rewrites is not consent.
                         .child(if snapshot.confirming {
                             // Different label, not the same button twice: "Replace" clicked twice
                             // by muscle memory must not be how a workspace gets rewritten.
                             Button::new()
                                 .filled()
                                 .on_press(confirm_replace)
-                                .child(format!("Replace {hits}?"))
+                                .child(if snapshot.results.truncated {
+                                    format!("Replace at least {hits}?")
+                                } else {
+                                    format!("Replace {hits}?")
+                                })
                                 .into_element()
                         } else {
                             Button::new().on_press(ask_replace).child("Replace all").into_element()
@@ -214,9 +248,19 @@ impl Component for SearchBox {
             })
             .map(snapshot.confirming.then_some(()), |root, ()| {
                 root.child(
-                    label().color(theme.danger).font_size(theme.font_size - 3.).text(format!(
-                        "Rewrites {hits} matches across {files} files. This cannot be undone.",
-                    )),
+                    label().color(theme.danger).font_size(theme.font_size - 3.).text(
+                        if snapshot.results.truncated {
+                            format!(
+                                "Rewrites every match in the workspace — at least {hits}, across \
+                                 more than {files} files. This cannot be undone.",
+                            )
+                        } else {
+                            format!(
+                                "Rewrites {hits} matches across {files} files. This cannot be \
+                                 undone.",
+                            )
+                        },
+                    ),
                 )
             })
             .map((!snapshot.notice.is_empty()).then_some(()), |root, ()| {

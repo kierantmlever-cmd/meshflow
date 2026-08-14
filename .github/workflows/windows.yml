@@ -1,0 +1,56 @@
+name: Windows build
+
+# A native Windows job rather than a cross-build. Skia publishes prebuilt binaries only for the
+# MSVC triple, and linking them with `lld-link` from Linux collides with the Windows SDK's own ICU
+# import library — a problem that does not exist here, where `link.exe` is the real thing and the
+# prebuilts are used exactly as they were produced.
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Skia is most of the build and none of it changes between runs. Keyed on the lockfile, so a
+      # dependency bump invalidates it and an ordinary code change does not.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      # Static CRT: a portable build has to run on a machine that has never had a Visual C++
+      # redistributable installed.
+      - name: Build
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/meshflow | Out-Null
+          Copy-Item target/release/meshflow.exe dist/meshflow/
+          # Its presence beside the executable is what makes the build portable — see
+          # `mf_engine::paths`. Git cannot carry an empty directory, so it is created here.
+          New-Item -ItemType Directory -Force -Path dist/meshflow/meshflow-data | Out-Null
+          Copy-Item dev/portable-README.txt dist/meshflow/README.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshflow-windows-x64
+          path: dist/meshflow
+          if-no-files-found: error

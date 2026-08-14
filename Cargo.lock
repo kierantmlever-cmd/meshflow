@@ -3075,6 +3075,7 @@ dependencies = [
  "futures",
  "globset",
  "keyring",
+ "regex",
  "reqwest",
  "secrecy",
  "serde",

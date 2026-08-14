@@ -14,3 +14,7 @@
 .env
 .env.*
 *.pem
+
+# Cross-build output: the Windows target directory and the packaged zip.
+/target-windows
+/dist
